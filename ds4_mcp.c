@@ -440,10 +440,11 @@ typedef struct {
     mcp_buf rx;
     bool connected;
     char *server_title; /* initialize result serverInfo.name if any */
-    /* Owned KEY=VALUE strings kept until this server runtime is freed so the
-     * post-fork child can still read them until exec replaces the address space. */
+    /* Owned KEY=VALUE overlays + full envp pointer table kept until this server
+     * runtime is freed so the post-fork child can still read them until exec. */
     char **child_env_owned;
     int child_env_owned_n;
+    char **child_envp;
 } mcp_server;
 
 typedef struct {
@@ -542,6 +543,8 @@ static void mcp_server_shutdown_runtime(mcp_server *s) {
         s->child_env_owned = NULL;
         s->child_env_owned_n = 0;
     }
+    free(s->child_envp);
+    s->child_envp = NULL;
     s->connected = false;
     s->next_id = 1;
 }
@@ -1299,7 +1302,8 @@ static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
     for (;;) {
         if (mcp_cancel(mcp)) {
             mcp_set_err(err, err_len, "interrupted");
-            if (out_status) *out_status = MCP_RPC_TRANSPORT;
+            /* Soft cancel: leave the process up (same as TIMEOUT). */
+            if (out_status) *out_status = MCP_RPC_TIMEOUT;
             return NULL;
         }
         mcp_server_drain_stderr(mcp, s);
@@ -1462,7 +1466,6 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     mcp_set_cloexec(err_pipe[0]);
     mcp_set_cloexec(err_pipe[1]);
 
-    /* Build argv in the parent so the child never mallocs after fork. */
     if (s->argc + 2 > DS4_MCP_MAX_ARGS + 2) {
         mcp_set_err(err, err_len, "too many args");
         close(in_pipe[0]); close(in_pipe[1]);
@@ -1470,20 +1473,53 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         close(err_pipe[0]); close(err_pipe[1]);
         return -1;
     }
+
+    /* Resolve PATH in the parent so the child only needs execve (no execvp). */
+    char resolved[PATH_MAX];
+    const char *exe = s->command;
+    if (s->command && !strchr(s->command, '/')) {
+        const char *path = getenv("PATH");
+        if (!path) path = "/usr/bin:/bin:/usr/sbin:/sbin";
+        bool found = false;
+        const char *p = path;
+        while (*p && !found) {
+            const char *colon = strchr(p, ':');
+            size_t len = colon ? (size_t)(colon - p) : strlen(p);
+            if (len > 0 && len + 1 + strlen(s->command) + 1 < sizeof(resolved)) {
+                memcpy(resolved, p, len);
+                resolved[len] = '/';
+                memcpy(resolved + len + 1, s->command, strlen(s->command) + 1);
+                if (access(resolved, X_OK) == 0) {
+                    exe = resolved;
+                    found = true;
+                }
+            }
+            if (!colon) break;
+            p = colon + 1;
+        }
+        if (!found) {
+            mcp_set_err(err, err_len, "command not found in PATH: %s", s->command);
+            close(in_pipe[0]); close(in_pipe[1]);
+            close(out_pipe[0]); close(out_pipe[1]);
+            close(err_pipe[0]); close(err_pipe[1]);
+            return -1;
+        }
+    }
+
     char *argv_stack[DS4_MCP_MAX_ARGS + 2];
-    argv_stack[0] = s->command;
+    argv_stack[0] = (char *)exe;
     for (int i = 0; i < s->argc; i++) argv_stack[i + 1] = s->args[i];
     argv_stack[s->argc + 1] = NULL;
 
     /*
-     * Build a complete envp in the parent (no setenv after fork).  Start from
-     * environ, then overlay server-specific KEY=VALUE entries.
+     * Build a complete envp in the parent and keep both the pointer table and
+     * owned KEY=VALUE overlays alive until server shutdown so the child can
+     * still read them until execve replaces the address space.
      */
     extern char **environ;
     int base_envc = 0;
     if (environ) while (environ[base_envc]) base_envc++;
-    int env_total = base_envc + s->envc + 1;
-    char **envp = mcp_xmalloc((size_t)env_total * sizeof(char *));
+    char **envp = mcp_xmalloc((size_t)(base_envc + s->envc + 1) * sizeof(char *));
     char **overlay = NULL;
     if (s->envc > 0) overlay = mcp_xmalloc((size_t)s->envc * sizeof(char *));
     for (int i = 0; i < s->envc; i++) {
@@ -1531,7 +1567,7 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         return -1;
     }
     if (pid == 0) {
-        /* Child: only async-signal-safe calls until exec. */
+        /* Child: keep the path short and mostly async-signal-safe until exec. */
         setpgid(0, 0);
         if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
         if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
@@ -1539,42 +1575,25 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
-
-        int maxfd = (int)sysconf(_SC_OPEN_MAX);
-        if (maxfd < 0) maxfd = 1024;
-        if (maxfd > 65536) maxfd = 65536;
-        for (int fd = 3; fd < maxfd; fd++)
+        /* Fixed FD range — avoid sysconf after multi-threaded fork. */
+        for (int fd = 3; fd < 256; fd++)
             close(fd);
-
-        /* Prefer absolute/path command via execve(envp). For PATH lookup without
-         * touching malloc, hand envp to execvpe when available. */
-#if defined(__linux__) || defined(__GLIBC__)
-        execvpe(s->command, argv_stack, envp);
-#else
-        execve(s->command, argv_stack, envp);
-        if (!strchr(s->command, '/')) {
-            /* Last resort PATH search; environ still points at parent copy —
-             * only safe if parent has not freed envp yet. Parent waits via
-             * short yield before free (below). */
-            environ = envp;
-            execvp(s->command, argv_stack);
-        }
-#endif
+        execve(exe, argv_stack, envp);
         const char *msg = "ds4_mcp: exec failed\n";
         (void)write(STDERR_FILENO, msg, 22);
         _exit(127);
     }
 
-    /* Parent: do not free child-visible env strings until this server is shut
-     * down. Stash owned KEY=VALUE overlays on the server object. */
+    /* Parent: keep envp + overlay alive until this server is shut down. */
     setpgid(pid, pid);
     if (s->child_env_owned) {
         for (int i = 0; i < s->child_env_owned_n; i++) free(s->child_env_owned[i]);
         free(s->child_env_owned);
     }
+    free(s->child_envp);
     s->child_env_owned = overlay;
     s->child_env_owned_n = s->envc;
-    free(envp); /* pointers only; owned strings are in child_env_owned / environ */
+    s->child_envp = envp;
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
@@ -1591,7 +1610,7 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     mcp_set_cloexec(s->stderr_fd);
     mcp_server_drain_stderr(mcp, s);
     mcp_log(mcp, "spawned MCP server %s pid=%ld cmd=%s",
-            s->name, (long)pid, s->command);
+            s->name, (long)pid, exe);
     return 0;
 }
 
@@ -2365,19 +2384,19 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
     free(params_s);
 
     if (st == MCP_RPC_TIMEOUT) {
-        /* Slow tool: leave process up and catalog intact so the model can retry
-         * or call something else. The in-flight call may still complete server-
-         * side; late replies are discarded by id filter. */
+        /* Slow tool or user interrupt: leave process up and catalog intact.
+         * In-flight work may still finish server-side; late replies are
+         * discarded by id filter. */
         if (!err[0])
             mcp_set_err(err, err_len,
-                        "MCP tool call timed out after %d s: %s",
-                        DS4_MCP_TOOL_CALL_TIMEOUT_MS / 1000, exposed_name);
+                        "MCP tool call timed out or interrupted: %s",
+                        exposed_name);
         free(resp);
         return NULL;
     }
     if (st == MCP_RPC_TRANSPORT) {
-        /* Broken pipe / interrupt / desync: drop runtime only, keep catalog so
-         * has_tool remains true and ensure_connected can retry. */
+        /* Broken pipe / desync: drop runtime only, keep catalog so has_tool
+         * remains true and ensure_connected can retry. */
         mcp_server_shutdown_runtime(s);
         if (ds4_mcp_connected_server_count(mcp) == 0)
             mcp->connected = false;

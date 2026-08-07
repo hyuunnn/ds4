@@ -8237,32 +8237,6 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  * ============================================================================
  */
 
-/* Demote only pure JSON scalars (not objects/arrays) for GLM's always-string
- * args. Objects stay quoted so string schema fields that happen to look like
- * JSON text are preserved; numbers/bools/null become typed JSON. */
-static bool agent_mcp_value_is_json_scalar(const char *s) {
-    if (!s || !s[0]) return false;
-    while (*s == ' ' || *s == '\t') s++;
-    if (!strcmp(s, "true") || !strcmp(s, "false") || !strcmp(s, "null"))
-        return true;
-    const char *n = s;
-    if (*n == '-') n++;
-    if (*n < '0' || *n > '9') return false;
-    while (*n >= '0' && *n <= '9') n++;
-    if (*n == '.') {
-        n++;
-        if (*n < '0' || *n > '9') return false;
-        while (*n >= '0' && *n <= '9') n++;
-    }
-    if (*n == 'e' || *n == 'E') {
-        n++;
-        if (*n == '+' || *n == '-') n++;
-        if (*n < '0' || *n > '9') return false;
-        while (*n >= '0' && *n <= '9') n++;
-    }
-    return *n == '\0';
-}
-
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -8279,11 +8253,9 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
-    /* Live catalog OR previously known configured server__tool (reconnect path).
-     * is_configured_tool alone would spawn on hallucinated names; require the
-     * name to look like server__tool and either be cataloged or match a server
-     * that already contributed tools at least once (has_tool history is the
-     * catalog — after failed re-list we restore snapshot so has_tool stays). */
+    /* Live catalog only — prevents hallucinated server__ names from spawning.
+     * Catalog is preserved across transport teardown and failed re-list so
+     * reconnect remains reachable for tools that were listed at least once. */
     if (w->mcp && ds4_mcp_has_tool(w->mcp, call->name)) {
         const char **names = NULL;
         const char **values = NULL;
@@ -8296,13 +8268,10 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             for (int i = 0; i < n; i++) {
                 names[i] = call->args[i].name;
                 values[i] = call->args[i].value;
-                bool as_str = call->args[i].is_string;
-                const char *v = call->args[i].value ? call->args[i].value : "";
-                /* GLM marks every arg string=true. Demote pure scalars only so
-                 * number/boolean schemas work; leave object-like text quoted. */
-                if (as_str && agent_mcp_value_is_json_scalar(v))
-                    as_str = false;
-                is_string[i] = as_str;
+                /* Honor parser flags only. DSML string="false" can emit raw
+                 * JSON numbers/bools; GLM always-string args stay quoted so
+                 * string-schema fields (ids/zips/flags) are not retyped. */
+                is_string[i] = call->args[i].is_string;
             }
         }
         char *args_json = ds4_mcp_build_args_json(names, values, is_string, n);
