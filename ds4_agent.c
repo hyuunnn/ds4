@@ -141,8 +141,9 @@ typedef struct {
     double accounting_started_at;
     int tokens_at_turn_start;
     bool continue_pending;
-    bool turn_is_continuation;
     bool suppress_continue;
+    /* True after a blocked update_goal attempt has been charged to this turn. */
+    bool blocked_counted_this_turn;
 } agent_goal;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -4332,32 +4333,34 @@ static void agent_goal_format_tokens(int64_t tokens, char *buf, size_t len) {
 
 static void agent_goal_refresh_status_label(agent_worker *w) {
     if (!w) return;
-    char *label = w->status.goal_label;
-    size_t len = sizeof(w->status.goal_label);
-    if (!w->goal.present) {
-        label[0] = '\0';
-        return;
+    char label[sizeof(w->status.goal_label)];
+    label[0] = '\0';
+    if (w->goal.present) {
+        char elapsed[32];
+        agent_goal_format_elapsed(w->goal.time_used_seconds, elapsed, sizeof(elapsed));
+        switch (w->goal.status) {
+        case AGENT_GOAL_ACTIVE:
+            snprintf(label, sizeof(label), " | goal: pursuing (%s) · %d/%d",
+                     elapsed, w->goal.continuation_count,
+                     AGENT_GOAL_MAX_CONTINUATIONS);
+            break;
+        case AGENT_GOAL_PAUSED:
+            snprintf(label, sizeof(label), " | goal: paused (/goal resume)");
+            break;
+        case AGENT_GOAL_BLOCKED:
+            snprintf(label, sizeof(label), " | goal: blocked");
+            break;
+        case AGENT_GOAL_COMPLETE:
+            snprintf(label, sizeof(label), " | goal: achieved");
+            break;
+        default:
+            break;
+        }
     }
-    char elapsed[32];
-    agent_goal_format_elapsed(w->goal.time_used_seconds, elapsed, sizeof(elapsed));
-    switch (w->goal.status) {
-    case AGENT_GOAL_ACTIVE:
-        snprintf(label, len, " | goal: pursuing (%s) · %d/%d",
-                 elapsed, w->goal.continuation_count, AGENT_GOAL_MAX_CONTINUATIONS);
-        break;
-    case AGENT_GOAL_PAUSED:
-        snprintf(label, len, " | goal: paused (/goal resume)");
-        break;
-    case AGENT_GOAL_BLOCKED:
-        snprintf(label, len, " | goal: blocked");
-        break;
-    case AGENT_GOAL_COMPLETE:
-        snprintf(label, len, " | goal: achieved");
-        break;
-    default:
-        label[0] = '\0';
-        break;
-    }
+    /* UI copies agent_status under the worker mutex; publish the label the same way. */
+    pthread_mutex_lock(&w->mu);
+    memcpy(w->status.goal_label, label, sizeof(w->status.goal_label));
+    pthread_mutex_unlock(&w->mu);
 }
 
 static char *agent_goal_format_show(const agent_goal *g) {
@@ -4507,17 +4510,76 @@ static bool agent_goal_json_parse_i64(const char *p, int64_t *out, const char **
     return true;
 }
 
+/* Skip a JSON string starting at the opening quote. */
+static const char *agent_goal_json_skip_string(const char *p) {
+    if (!p || *p != '"') return p;
+    p++;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p += 2;
+        else p++;
+    }
+    if (*p == '"') p++;
+    return p;
+}
+
+/* Skip one JSON value so key lookup never matches text inside strings/objects. */
+static const char *agent_goal_json_skip_value(const char *p) {
+    p = agent_goal_json_skip_ws(p);
+    if (!p || !*p) return p;
+    if (*p == '"') return agent_goal_json_skip_string(p);
+    if (*p == '{' || *p == '[') {
+        char open = *p;
+        char close = open == '{' ? '}' : ']';
+        int depth = 1;
+        p++;
+        while (*p && depth > 0) {
+            if (*p == '"') {
+                p = agent_goal_json_skip_string(p);
+                continue;
+            }
+            if (*p == open) depth++;
+            else if (*p == close) depth--;
+            p++;
+        }
+        return p;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']' &&
+           !isspace((unsigned char)*p))
+        p++;
+    return p;
+}
+
+/*
+ * Find a member value in a JSON object by walking members only.
+ * `json` may point at the opening '{' or at the first member.
+ * Does not match keys that appear only inside string values.
+ */
 static const char *agent_goal_json_find_key(const char *json, const char *key) {
     if (!json || !key) return NULL;
-    char pattern[96];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = json;
-    size_t plen = strlen(pattern);
-    while ((p = strstr(p, pattern)) != NULL) {
-        const char *after = p + plen;
-        after = agent_goal_json_skip_ws(after);
-        if (*after == ':') return after + 1;
-        p += plen;
+    const char *p = agent_goal_json_skip_ws(json);
+    if (*p == '{') p++;
+    size_t klen = strlen(key);
+    while (*p) {
+        p = agent_goal_json_skip_ws(p);
+        if (*p == '}' || !*p) return NULL;
+        if (*p != '"') return NULL;
+        const char *kstart = p + 1;
+        const char *kend = kstart;
+        while (*kend && *kend != '"') {
+            if (*kend == '\\' && kend[1]) kend += 2;
+            else kend++;
+        }
+        size_t n = (size_t)(kend - kstart);
+        bool match = (n == klen && memcmp(kstart, key, klen) == 0);
+        p = (*kend == '"') ? kend + 1 : kend;
+        p = agent_goal_json_skip_ws(p);
+        if (*p != ':') return NULL;
+        p++;
+        p = agent_goal_json_skip_ws(p);
+        if (match) return p;
+        p = agent_goal_json_skip_value(p);
+        p = agent_goal_json_skip_ws(p);
+        if (*p == ',') p++;
     }
     return NULL;
 }
@@ -4658,7 +4720,7 @@ static void agent_goal_archive_if_needed(agent_worker *w, const agent_goal *old)
     if (path && json) {
         FILE *fp = fopen(path, "ab");
         if (fp) {
-            /* history lines store the inner goal object only for compactness */
+            /* One full store document per completed goal (version + goal object). */
             fputs(json, fp);
             fclose(fp);
         }
@@ -4786,6 +4848,11 @@ static bool agent_goal_user_set_status(agent_worker *w, agent_goal_status st,
         w->goal.consecutive_blocked_signals = 0;
         free(w->goal.last_block_signature);
         w->goal.last_block_signature = NULL;
+        /* Resume starts a fresh automatic-continuation budget so a previous
+         * max-turn pause does not immediately re-pause. */
+        if (cur != AGENT_GOAL_ACTIVE)
+            w->goal.continuation_count = 0;
+        w->goal.blocked_counted_this_turn = false;
         w->goal.continue_pending = true;
         w->goal.suppress_continue = false;
     } else {
@@ -4812,8 +4879,8 @@ static void agent_goal_account_turn_start(agent_worker *w, bool is_continuation)
     if (!w || !w->goal.present || w->goal.status != AGENT_GOAL_ACTIVE) return;
     w->goal.accounting_started_at = now_sec();
     w->goal.tokens_at_turn_start = w->transcript.len;
-    w->goal.turn_is_continuation = is_continuation;
     w->goal.suppress_continue = false;
+    w->goal.blocked_counted_this_turn = false;
     if (is_continuation) {
         w->goal.continuation_count++;
         w->goal.updated_at = agent_goal_now_sec();
@@ -4838,7 +4905,8 @@ static void agent_goal_account_turn_end(agent_worker *w) {
     w->goal.tokens_at_turn_start = w->transcript.len;
     w->goal.updated_at = agent_goal_now_sec();
     agent_goal_refresh_status_label(w);
-    (void)agent_worker_goal_persist(w, NULL, 0);
+    /* Usage counters stay in memory on the hot path; status changes, interrupt,
+     * max-turn pause, and /save flush the sidecar. */
 }
 
 static void agent_goal_mark_interrupted(agent_worker *w) {
@@ -4885,6 +4953,15 @@ static void agent_goal_maybe_queue_continuation(agent_worker *w) {
         return;
     }
     w->goal.continue_pending = true;
+}
+
+/* Account usage after a hard turn failure and re-arm continuation for active
+ * goals so the session is not left pursuing with continue_pending clear. */
+static void agent_goal_on_turn_failure(agent_worker *w) {
+    if (!w || !w->goal.present) return;
+    if (w->goal.status != AGENT_GOAL_ACTIVE) return;
+    agent_goal_account_turn_end(w);
+    agent_goal_maybe_queue_continuation(w);
 }
 
 static char *agent_goal_build_continuation_prompt(const agent_goal *g) {
@@ -5054,6 +5131,19 @@ static char *agent_tool_update_goal(agent_worker *w, const agent_tool_call *call
     if (want == AGENT_GOAL_BLOCKED) {
         if (!reason || !reason[0])
             return xstrdup("Tool error: reason is required when status is blocked\n");
+        /* At most one blocked-audit charge per goal turn. */
+        if (w->goal.blocked_counted_this_turn) {
+            agent_buf b = {0};
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "Tool error: blocked already recorded for this goal turn "
+                     "(%d/3 consecutive identical conditions). Keep working this "
+                     "turn; only a later goal turn with the same condition advances "
+                     "the audit.\n",
+                     w->goal.consecutive_blocked_signals);
+            agent_buf_puts(&b, msg);
+            return agent_buf_take(&b);
+        }
         char *sig = agent_goal_normalize_signature(reason);
         bool same = w->goal.last_block_signature &&
                     !strcmp(w->goal.last_block_signature, sig);
@@ -5066,13 +5156,14 @@ static char *agent_tool_update_goal(agent_worker *w, const agent_tool_call *call
             w->goal.consecutive_blocked_signals = 1;
         }
         free(sig);
+        w->goal.blocked_counted_this_turn = true;
         if (w->goal.consecutive_blocked_signals < 3) {
             agent_buf b = {0};
             char msg[256];
             snprintf(msg, sizeof(msg),
                      "Tool error: blocked rejected (%d/3 consecutive identical "
-                     "blocking conditions). Keep working or retry blocked only after "
-                     "the same condition recurs for three consecutive goal turns.\n",
+                     "blocking conditions across goal turns). Keep working or retry "
+                     "blocked only after the same condition recurs on later turns.\n",
                      w->goal.consecutive_blocked_signals);
             agent_buf_puts(&b, msg);
             (void)agent_worker_goal_persist(w, NULL, 0);
@@ -5109,6 +5200,10 @@ static char *agent_tool_update_goal(agent_worker *w, const agent_tool_call *call
         w->goal.blocked_reason = NULL;
         w->goal.blocked_at = 0;
         w->goal.last_started_at = 0;
+        w->goal.consecutive_blocked_signals = 0;
+        free(w->goal.last_block_signature);
+        w->goal.last_block_signature = NULL;
+        w->goal.blocked_counted_this_turn = false;
         agent_publish_system_status(w, "Goal achieved");
     } else {
         free(w->goal.blocked_reason);
@@ -8358,7 +8453,8 @@ static void test_agent_goal_json_roundtrip(void) {
     agent_goal g = {0};
     g.present = true;
     snprintf(g.id, sizeof(g.id), "%s", "0123456789abcdef0123456789abcdef");
-    g.objective = xstrdup("analyze apk \"x\" & y");
+    /* Objective embeds key-like text that must not confuse member lookup. */
+    g.objective = xstrdup("analyze apk \"status\": \"complete\" and \"tokens_used\": 9");
     g.status = AGENT_GOAL_ACTIVE;
     g.tokens_used = 1234;
     g.time_used_seconds = 90;
@@ -8371,7 +8467,7 @@ static void test_agent_goal_json_roundtrip(void) {
 
     char *json = agent_goal_serialize(&g);
     AGENT_TEST_ASSERT(json && strstr(json, "\"version\": 1"));
-    AGENT_TEST_ASSERT(strstr(json, "analyze apk \\\"x\\\" & y") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\\\"status\\\": \\\"complete\\\"") != NULL);
 
     agent_goal loaded = {0};
     AGENT_TEST_ASSERT(agent_goal_parse_json(json, &loaded));
@@ -8481,16 +8577,41 @@ static void test_agent_goal_blocked_signature_counter(void) {
     AGENT_TEST_ASSERT(w.goal.status == AGENT_GOAL_ACTIVE);
     AGENT_TEST_ASSERT(w.goal.consecutive_blocked_signals == 1);
 
+    /* Same turn must not burn additional strikes. */
+    char *r_same = agent_tool_update_goal(&w, &call);
+    AGENT_TEST_ASSERT(r_same && strstr(r_same, "already recorded"));
+    free(r_same);
+    AGENT_TEST_ASSERT(w.goal.consecutive_blocked_signals == 1);
+
+    w.goal.blocked_counted_this_turn = false;
     char *r2 = agent_tool_update_goal(&w, &call);
     AGENT_TEST_ASSERT(r2 && strstr(r2, "2/3"));
     free(r2);
 
+    w.goal.blocked_counted_this_turn = false;
     char *r3 = agent_tool_update_goal(&w, &call);
     AGENT_TEST_ASSERT(r3 && strstr(r3, "\"status\": \"blocked\""));
     free(r3);
     AGENT_TEST_ASSERT(w.goal.status == AGENT_GOAL_BLOCKED);
 
     agent_tool_call_free(&call);
+    agent_goal_clear(&w.goal);
+}
+
+static void test_agent_goal_resume_resets_continuation_budget(void) {
+    agent_worker w = {0};
+    w.goal.present = true;
+    w.goal.status = AGENT_GOAL_PAUSED;
+    w.goal.objective = xstrdup("obj");
+    w.goal.continuation_count = AGENT_GOAL_MAX_CONTINUATIONS;
+    agent_goal_random_id(w.goal.id);
+
+    char err[160] = {0};
+    AGENT_TEST_ASSERT(agent_goal_user_set_status(&w, AGENT_GOAL_ACTIVE,
+                                                  err, sizeof(err)));
+    AGENT_TEST_ASSERT(w.goal.status == AGENT_GOAL_ACTIVE);
+    AGENT_TEST_ASSERT(w.goal.continuation_count == 0);
+    AGENT_TEST_ASSERT(agent_goal_should_continue(&w));
     agent_goal_clear(&w.goal);
 }
 
@@ -8544,6 +8665,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_goal_sidecar_file();
     test_agent_goal_should_continue_matrix();
     test_agent_goal_blocked_signature_counter();
+    test_agent_goal_resume_resets_continuation_budget();
     test_agent_goal_continuation_prefix();
     test_agent_goal_tools_in_prompts();
 }
@@ -10057,6 +10179,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
+        agent_goal_on_turn_failure(w);
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
         return 1;
     }
@@ -10102,6 +10225,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_set_status(w, AGENT_WORKER_IDLE);
                 return 0;
             }
+            agent_goal_on_turn_failure(w);
             agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
             return 1;
         }
@@ -10159,6 +10283,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 0;
         }
         if (sync_rc != 0) {
+            agent_goal_on_turn_failure(w);
             agent_set_error(w, err);
             return 1;
         }
@@ -10232,6 +10357,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                                 &generated, t0, &stream,
                                                 err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
+                    agent_goal_on_turn_failure(w);
                     agent_set_error(w, err);
                     return 1;
                 }
@@ -10240,6 +10366,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (worker_accept_generated_token(w, token, &generated, t0,
                                                   &stream, err, sizeof(err)) != 0) {
                     agent_dsml_parser_free(&dsml);
+                    agent_goal_on_turn_failure(w);
                     agent_set_error(w, err);
                     return 1;
                 }
@@ -10353,6 +10480,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     agent_set_status(w, AGENT_WORKER_IDLE);
                     return 0;
                 }
+                agent_goal_on_turn_failure(w);
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
                 return 1;
             }
@@ -10373,6 +10501,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
                     free(tool_result);
                     agent_dsml_parser_free(&dsml);
+                    agent_goal_on_turn_failure(w);
                     agent_set_error(w, "context full after compaction");
                     return 1;
                 }
@@ -10767,13 +10896,20 @@ static bool worker_submit(agent_worker *w, const char *text) {
  * the flag and return a malloc'd continuation prompt for worker_submit. */
 static char *worker_take_goal_continuation(agent_worker *w) {
     if (!w || !worker_is_idle(w)) return NULL;
-    if (!w->goal.continue_pending) return NULL;
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->goal.continue_pending;
+    pthread_mutex_unlock(&w->mu);
+    if (!pending) return NULL;
     if (!agent_goal_should_continue(w)) {
+        pthread_mutex_lock(&w->mu);
         w->goal.continue_pending = false;
+        pthread_mutex_unlock(&w->mu);
         agent_goal_maybe_queue_continuation(w);
         return NULL;
     }
+    pthread_mutex_lock(&w->mu);
     w->goal.continue_pending = false;
+    pthread_mutex_unlock(&w->mu);
     return agent_goal_build_continuation_prompt(&w->goal);
 }
 
@@ -10783,9 +10919,21 @@ static bool worker_request_goal_continue(agent_worker *w) {
     if (!cont) return false;
     agent_publish_system_status(w, "[goal] continuing…");
     bool ok = worker_submit(w, cont);
-    if (!ok) w->goal.continue_pending = true;
+    if (!ok) {
+        pthread_mutex_lock(&w->mu);
+        w->goal.continue_pending = true;
+        pthread_mutex_unlock(&w->mu);
+    }
     free(cont);
     return ok;
+}
+
+static bool worker_goal_continue_pending(agent_worker *w) {
+    if (!w) return false;
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->goal.continue_pending;
+    pthread_mutex_unlock(&w->mu);
+    return pending;
 }
 
 static int worker_status_power_locked(agent_worker *w) {
@@ -12337,7 +12485,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             free(queued);
         }
 
-        if (!one_shot && idle && !queue.len && worker.goal.continue_pending) {
+        if (!one_shot && idle && !queue.len &&
+            worker_goal_continue_pending(&worker)) {
             if (worker_request_goal_continue(&worker))
                 idle = false;
         }
@@ -12631,7 +12780,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (!initial_pending && !queue.len && worker_is_idle(&worker) &&
-            worker.goal.continue_pending)
+            worker_goal_continue_pending(&worker))
         {
             (void)worker_request_goal_continue(&worker);
         }
