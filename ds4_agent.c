@@ -7159,6 +7159,10 @@ static void test_agent_mcp_helpers(void) {
     AGENT_TEST_ASSERT(!strcmp(tool, "echo"));
     AGENT_TEST_ASSERT(!ds4_mcp_split_exposed_name("nope", server, sizeof(server),
                                                    tool, sizeof(tool)));
+    /* "__" inside either side is rejected so the delimiter stays unambiguous. */
+    AGENT_TEST_ASSERT(!ds4_mcp_split_exposed_name("demo__debug__tool", server,
+                                                   sizeof(server), tool,
+                                                   sizeof(tool)));
     free(exposed);
 
     const char *names[] = { "path", "max_lines", "raw" };
@@ -7174,6 +7178,35 @@ static void test_agent_mcp_helpers(void) {
     int fd = mkstemp(path);
     AGENT_TEST_ASSERT(fd >= 0);
     if (fd < 0) return;
+
+    /* Reject server names containing "__". */
+    {
+        const char *bad =
+            "{\"mcpServers\":{\"demo__x\":{\"command\":\"/bin/false\"}}}";
+        AGENT_TEST_ASSERT(ftruncate(fd, 0) == 0);
+        AGENT_TEST_ASSERT(lseek(fd, 0, SEEK_SET) == 0);
+        AGENT_TEST_ASSERT(write(fd, bad, strlen(bad)) == (ssize_t)strlen(bad));
+        char err[160] = {0};
+        ds4_mcp_config c = { .config_path = path, .auto_approve = true };
+        ds4_mcp *m = ds4_mcp_create(&c, err, sizeof(err));
+        AGENT_TEST_ASSERT(m == NULL);
+        AGENT_TEST_ASSERT(strstr(err, "invalid MCP server name") != NULL);
+    }
+
+    /* Truncated args array is rejected. */
+    {
+        const char *bad =
+            "{\"mcpServers\":{\"demo\":{\"command\":\"x\",\"args\":[\"a\"}}}";
+        AGENT_TEST_ASSERT(ftruncate(fd, 0) == 0);
+        AGENT_TEST_ASSERT(lseek(fd, 0, SEEK_SET) == 0);
+        AGENT_TEST_ASSERT(write(fd, bad, strlen(bad)) == (ssize_t)strlen(bad));
+        char err[160] = {0};
+        ds4_mcp_config c = { .config_path = path, .auto_approve = true };
+        ds4_mcp *m = ds4_mcp_create(&c, err, sizeof(err));
+        AGENT_TEST_ASSERT(m == NULL);
+        AGENT_TEST_ASSERT(err[0] != '\0');
+    }
+
     const char *body =
         "{\n"
         "  \"mcpServers\": {\n"
@@ -7189,6 +7222,8 @@ static void test_agent_mcp_helpers(void) {
         "    }\n"
         "  }\n"
         "}\n";
+    AGENT_TEST_ASSERT(ftruncate(fd, 0) == 0);
+    AGENT_TEST_ASSERT(lseek(fd, 0, SEEK_SET) == 0);
     AGENT_TEST_ASSERT(write(fd, body, strlen(body)) == (ssize_t)strlen(body));
     close(fd);
 
@@ -7204,6 +7239,7 @@ static void test_agent_mcp_helpers(void) {
         return;
     }
     AGENT_TEST_ASSERT(ds4_mcp_server_count(mcp) == 2);
+    AGENT_TEST_ASSERT(ds4_mcp_connected_server_count(mcp) == 0);
     AGENT_TEST_ASSERT(ds4_mcp_tool_count(mcp) == 0);
     char *dsml = ds4_mcp_build_dsml_schemas(mcp);
     AGENT_TEST_ASSERT(dsml && dsml[0] == '\0');
@@ -9289,8 +9325,9 @@ static void *worker_main(void *arg) {
         } else {
             char status[128];
             snprintf(status, sizeof(status),
-                     "MCP ready: %d tool(s) from %d server(s)",
-                     ds4_mcp_tool_count(w->mcp), ds4_mcp_server_count(w->mcp));
+                     "MCP ready: %d tool(s) from %d connected server(s)",
+                     ds4_mcp_tool_count(w->mcp),
+                     ds4_mcp_connected_server_count(w->mcp));
             agent_publish_system_status(w, status);
             agent_trace(w, "%s", status);
         }

@@ -244,9 +244,11 @@ static const char *mcp_json_skip_value(const char *p) {
         return s ? end : NULL;
     }
     if (*p == '{' || *p == '[') {
-        char open = *p;
-        char close = open == '{' ? '}' : ']';
-        int depth = 1;
+        /* Track both braces and brackets so nested arrays inside objects (and
+         * the reverse) cannot prematurely close the outer container. */
+        const char *stack[64];
+        int depth = 0;
+        stack[depth++] = p;
         bool in_str = false;
         bool esc = false;
         p++;
@@ -258,9 +260,21 @@ static const char *mcp_json_skip_value(const char *p) {
                 else if (c == '"') in_str = false;
                 continue;
             }
-            if (c == '"') in_str = true;
-            else if (c == open) depth++;
-            else if (c == close) depth--;
+            if (c == '"') {
+                in_str = true;
+                continue;
+            }
+            if (c == '{' || c == '[') {
+                if (depth >= (int)(sizeof(stack) / sizeof(stack[0]))) return NULL;
+                stack[depth++] = p - 1;
+                continue;
+            }
+            if (c == '}' || c == ']') {
+                char open = *stack[depth - 1];
+                char expect = open == '{' ? '}' : ']';
+                if (c != expect) return NULL;
+                depth--;
+            }
         }
         return depth == 0 ? p : NULL;
     }
@@ -410,8 +424,6 @@ typedef struct {
     int stdout_fd;
     int next_id;
     mcp_buf rx;
-    bool use_content_length; /* set after first framed message, else NDJSON */
-    bool framed_known;
     bool connected;
     char *server_title; /* initialize result serverInfo.name if any */
 } mcp_server;
@@ -465,7 +477,7 @@ static bool mcp_cancel(ds4_mcp *mcp) {
     return mcp && mcp->cancel && mcp->cancel(mcp->cancel_privdata);
 }
 
-/* Stop a live process and drop runtime I/O state, keeping config fields. */
+/* Stop a live process group and drop runtime I/O state, keeping config fields. */
 static void mcp_server_shutdown_runtime(mcp_server *s) {
     if (!s) return;
     free(s->rx.ptr);
@@ -482,6 +494,8 @@ static void mcp_server_shutdown_runtime(mcp_server *s) {
         s->stdout_fd = -1;
     }
     if (s->pid > 0) {
+        /* Kill the process group so npx/node wrappers and their children die. */
+        kill(-s->pid, SIGTERM);
         kill(s->pid, SIGTERM);
         int status = 0;
         for (int i = 0; i < 20; i++) {
@@ -490,14 +504,13 @@ static void mcp_server_shutdown_runtime(mcp_server *s) {
             usleep(50 * 1000);
         }
         if (waitpid(s->pid, &status, WNOHANG) == 0) {
+            kill(-s->pid, SIGKILL);
             kill(s->pid, SIGKILL);
             waitpid(s->pid, &status, 0);
         }
         s->pid = -1;
     }
     s->connected = false;
-    s->framed_known = false;
-    s->use_content_length = false;
     s->next_id = 1;
 }
 
@@ -544,10 +557,23 @@ static bool mcp_is_ident_char(char c) {
            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
 }
 
+/* Server keys must not contain "__" so exposed names server__tool split cleanly. */
 static bool mcp_valid_server_name(const char *name) {
     if (!name || !name[0]) return false;
     for (const char *p = name; *p; p++) {
         if (!mcp_is_ident_char(*p)) return false;
+        if (p[0] == '_' && p[1] == '_') return false;
+    }
+    return true;
+}
+
+/* Tool names may use a slightly wider set; still no "__" and must be JSON-safe
+ * identifiers we can embed without escaping surprises. */
+static bool mcp_valid_tool_name(const char *name) {
+    if (!name || !name[0]) return false;
+    for (const char *p = name; *p; p++) {
+        if (!mcp_is_ident_char(*p)) return false;
+        if (p[0] == '_' && p[1] == '_') return false;
     }
     return true;
 }
@@ -566,9 +592,13 @@ static int mcp_parse_string_array(const char *arr, char ***out_v, int *out_n,
     p++;
     char **v = NULL;
     int n = 0, cap = 0;
+    bool closed = false;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
-        if (*p == ']') break;
+        if (*p == ']') {
+            closed = true;
+            break;
+        }
         if (*p != '"') {
             mcp_set_err(err, err_len, "args entries must be strings");
             for (int i = 0; i < n; i++) free(v[i]);
@@ -605,6 +635,12 @@ static int mcp_parse_string_array(const char *arr, char ***out_v, int *out_n,
         }
         v[n++] = s;
     }
+    if (!closed) {
+        for (int i = 0; i < n; i++) free(v[i]);
+        free(v);
+        mcp_set_err(err, err_len, "truncated JSON array (missing ']')");
+        return -1;
+    }
     *out_v = v;
     *out_n = n;
     return 0;
@@ -624,9 +660,13 @@ static int mcp_parse_env_object(const char *obj, mcp_env **out_v, int *out_n,
     p++;
     mcp_env *v = NULL;
     int n = 0, cap = 0;
+    bool closed = false;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
-        if (*p == '}') break;
+        if (*p == '}') {
+            closed = true;
+            break;
+        }
         if (*p != '"') {
             mcp_set_err(err, err_len, "invalid env object");
             for (int i = 0; i < n; i++) {
@@ -715,6 +755,15 @@ static int mcp_parse_env_object(const char *obj, mcp_env **out_v, int *out_n,
         v[n].value = val;
         n++;
     }
+    if (!closed) {
+        for (int i = 0; i < n; i++) {
+            free(v[i].key);
+            free(v[i].value);
+        }
+        free(v);
+        mcp_set_err(err, err_len, "truncated JSON object (missing '}')");
+        return -1;
+    }
     *out_v = v;
     *out_n = n;
     return 0;
@@ -724,6 +773,11 @@ static int mcp_add_server_from_obj(ds4_mcp *mcp, const char *name,
                                    const char *obj, char *err, size_t err_len) {
     if (!mcp_valid_server_name(name)) {
         mcp_set_err(err, err_len, "invalid MCP server name: %s", name ? name : "");
+        return -1;
+    }
+    /* Reject truncated/malformed server objects early (e.g. unclosed args[]). */
+    if (!mcp_json_skip_value(obj)) {
+        mcp_set_err(err, err_len, "server %s: malformed JSON object", name);
         return -1;
     }
     if (mcp->server_count >= DS4_MCP_MAX_SERVERS) {
@@ -805,9 +859,13 @@ static int mcp_parse_servers_object(ds4_mcp *mcp, const char *obj,
         return -1;
     }
     p++;
+    bool closed = false;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
-        if (*p == '}') break;
+        if (*p == '}') {
+            closed = true;
+            break;
+        }
         if (*p != '"') {
             mcp_set_err(err, err_len, "invalid mcpServers object");
             return -1;
@@ -840,6 +898,10 @@ static int mcp_parse_servers_object(ds4_mcp *mcp, const char *obj,
         free(name);
         if (rc != 0) return -1;
         p = v_end;
+    }
+    if (!closed) {
+        mcp_set_err(err, err_len, "truncated mcpServers object (missing '}')");
+        return -1;
     }
     return 0;
 }
@@ -881,15 +943,20 @@ bool ds4_mcp_split_exposed_name(const char *exposed, char *server, size_t server
                                 char *tool, size_t tool_len) {
     if (!exposed || !server || !tool || server_len == 0 || tool_len == 0)
         return false;
+    /* First "__" is the delimiter; server names are forbidden from containing it. */
     const char *sep = strstr(exposed, "__");
     if (!sep || sep == exposed || !sep[2]) return false;
+    /* Reject extra "__" in the tool side so split stays unambiguous. */
+    if (strstr(sep + 2, "__")) return false;
     size_t sn = (size_t)(sep - exposed);
     if (sn + 1 > server_len) return false;
     memcpy(server, exposed, sn);
     server[sn] = '\0';
     if (strlen(sep + 2) + 1 > tool_len) return false;
     snprintf(tool, tool_len, "%s", sep + 2);
-    return server[0] && tool[0];
+    if (!mcp_valid_server_name(server) || !mcp_valid_tool_name(tool))
+        return false;
+    return true;
 }
 
 char *ds4_mcp_build_args_json(const char *const *names,
@@ -1053,8 +1120,6 @@ static char *mcp_server_take_message(mcp_server *s) {
         memmove(s->rx.ptr, s->rx.ptr + header_total + (size_t)content_len, remain);
         s->rx.len = remain;
         s->rx.ptr[s->rx.len] = '\0';
-        s->use_content_length = true;
-        s->framed_known = true;
         return msg;
     }
 
@@ -1080,8 +1145,6 @@ static char *mcp_server_take_message(mcp_server *s) {
     memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
     s->rx.len = remain;
     s->rx.ptr[s->rx.len] = '\0';
-    s->use_content_length = false;
-    s->framed_known = true;
     return msg;
 }
 
@@ -1193,7 +1256,8 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         return -1;
     }
     if (pid == 0) {
-        /* Child */
+        /* Child: own process group so shutdown can kill grandchildren. */
+        setpgid(0, 0);
         close(in_pipe[1]);
         close(out_pipe[0]);
         if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
@@ -1201,6 +1265,12 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         /* Leave stderr shared so server logs are visible. */
         close(in_pipe[0]);
         close(out_pipe[1]);
+
+        /* Drop inherited FDs (agent pipes, other MCP servers, model handles). */
+        int maxfd = (int)sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0 || maxfd > 1024) maxfd = 1024;
+        for (int fd = 3; fd < maxfd; fd++)
+            close(fd);
 
         for (int i = 0; i < s->envc; i++) {
             if (s->env[i].key && s->env[i].value)
@@ -1218,7 +1288,9 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         _exit(127);
     }
 
-    /* Parent */
+    /* Parent: make sure the child is in its own process group even if it has
+     * not reached setpgid yet. */
+    setpgid(pid, pid);
     close(in_pipe[0]);
     close(out_pipe[1]);
     s->pid = pid;
@@ -1230,11 +1302,37 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     return 0;
 }
 
+static void mcp_remove_tools_for_server(ds4_mcp *mcp, const char *server_name) {
+    if (!mcp || !server_name || !mcp->tools) return;
+    int w = 0;
+    for (int i = 0; i < mcp->tool_count; i++) {
+        if (mcp->tools[i].server_name &&
+            !strcmp(mcp->tools[i].server_name, server_name))
+        {
+            mcp_tool_clear(&mcp->tools[i]);
+            continue;
+        }
+        if (w != i) mcp->tools[w] = mcp->tools[i];
+        w++;
+    }
+    /* Zero vacated slots so a later free cannot double-free moved entries. */
+    for (int i = w; i < mcp->tool_count; i++)
+        memset(&mcp->tools[i], 0, sizeof(mcp->tools[i]));
+    mcp->tool_count = w;
+}
+
 static int mcp_tool_add(ds4_mcp *mcp, const char *server_name,
                         const char *tool_name, const char *description,
                         const char *input_schema_json,
                         char *err, size_t err_len) {
     if (!tool_name || !tool_name[0]) return 0;
+    if (!mcp_valid_tool_name(tool_name)) {
+        mcp_set_err(err, err_len,
+                    "invalid MCP tool name from %s: %s "
+                    "(use [A-Za-z0-9_.-], no \"__\")",
+                    server_name ? server_name : "?", tool_name);
+        return -1;
+    }
     if (mcp->tool_count >= DS4_MCP_MAX_TOOLS) {
         mcp_set_err(err, err_len, "too many MCP tools (max %d)", DS4_MCP_MAX_TOOLS);
         return -1;
@@ -1262,24 +1360,8 @@ static int mcp_tool_add(ds4_mcp *mcp, const char *server_name,
     return 0;
 }
 
-static int mcp_parse_tools_list_result(ds4_mcp *mcp, const char *server_name,
-                                       const char *result_json,
-                                       char *err, size_t err_len) {
-    const char *tools_end = NULL;
-    const char *tools = mcp_json_obj_get(result_json, "tools", &tools_end);
-    if (!tools) {
-        /* Some servers return the array directly as result. */
-        const char *p = result_json;
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        if (*p == '[') {
-            tools = p;
-            tools_end = mcp_json_skip_value(p);
-        }
-    }
-    if (!tools) {
-        mcp_set_err(err, err_len, "tools/list missing tools array");
-        return -1;
-    }
+static int mcp_parse_tools_array(ds4_mcp *mcp, const char *server_name,
+                                 const char *tools, char *err, size_t err_len) {
     const char *p = tools;
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p != '[') {
@@ -1287,9 +1369,13 @@ static int mcp_parse_tools_list_result(ds4_mcp *mcp, const char *server_name,
         return -1;
     }
     p++;
+    bool closed = false;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
-        if (*p == ']') break;
+        if (*p == ']') {
+            closed = true;
+            break;
+        }
         if (*p != '{') {
             mcp_set_err(err, err_len, "invalid tool entry");
             return -1;
@@ -1314,11 +1400,85 @@ static int mcp_parse_tools_list_result(ds4_mcp *mcp, const char *server_name,
         if (rc != 0) return -1;
         p = obj_end;
     }
+    if (!closed) {
+        mcp_set_err(err, err_len, "truncated tools array (missing ']')");
+        return -1;
+    }
+    return 0;
+}
+
+static int mcp_parse_tools_list_result(ds4_mcp *mcp, const char *server_name,
+                                       const char *result_json,
+                                       char *err, size_t err_len) {
+    const char *tools_end = NULL;
+    const char *tools = mcp_json_obj_get(result_json, "tools", &tools_end);
+    if (!tools) {
+        /* Some servers return the array directly as result. */
+        const char *p = result_json;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '[') {
+            tools = p;
+            tools_end = mcp_json_skip_value(p);
+        }
+    }
+    if (!tools) {
+        mcp_set_err(err, err_len, "tools/list missing tools array");
+        return -1;
+    }
+    return mcp_parse_tools_array(mcp, server_name, tools, err, err_len);
+}
+
+/* Fetch all tools/list pages when the server returns nextCursor. */
+static int mcp_server_list_all_tools(ds4_mcp *mcp, mcp_server *s,
+                                    char *err, size_t err_len) {
+    char *cursor = NULL;
+    for (int page = 0; page < 64; page++) {
+        mcp_buf params = {0};
+        if (cursor && cursor[0]) {
+            char *qc = mcp_json_quote(cursor);
+            mcp_buf_puts(&params, "{\"cursor\":");
+            mcp_buf_puts(&params, qc);
+            mcp_buf_puts(&params, "}");
+            free(qc);
+        } else {
+            mcp_buf_puts(&params, "{}");
+        }
+        char *params_s = mcp_buf_take(&params);
+        char *list_resp = mcp_rpc(mcp, s, "tools/list", params_s, err, err_len);
+        free(params_s);
+        if (!list_resp) {
+            free(cursor);
+            return -1;
+        }
+        char *list_result = mcp_json_get_result_raw(list_resp);
+        free(list_resp);
+        if (!list_result) {
+            free(cursor);
+            mcp_set_err(err, err_len, "tools/list returned no result");
+            return -1;
+        }
+        int rc = mcp_parse_tools_list_result(mcp, s->name, list_result, err, err_len);
+        if (rc != 0) {
+            free(list_result);
+            free(cursor);
+            return -1;
+        }
+        free(cursor);
+        cursor = mcp_json_get_string(list_result, "nextCursor");
+        free(list_result);
+        if (!cursor || !cursor[0]) {
+            free(cursor);
+            cursor = NULL;
+            break;
+        }
+    }
+    free(cursor);
     return 0;
 }
 
 static int mcp_server_initialize(ds4_mcp *mcp, mcp_server *s,
                                  char *err, size_t err_len) {
+    int tools_before = mcp->tool_count;
     const char *params =
         "{"
         "\"protocolVersion\":\"2024-11-05\","
@@ -1340,20 +1500,17 @@ static int mcp_server_initialize(ds4_mcp *mcp, mcp_server *s,
         }
         free(result);
     }
-    if (mcp_notify(mcp, s, "notifications/initialized", NULL, err, err_len) != 0)
-        return -1;
-
-    char *list_resp = mcp_rpc(mcp, s, "tools/list", "{}", err, err_len);
-    if (!list_resp) return -1;
-    char *list_result = mcp_json_get_result_raw(list_resp);
-    free(list_resp);
-    if (!list_result) {
-        mcp_set_err(err, err_len, "tools/list returned no result");
+    if (mcp_notify(mcp, s, "notifications/initialized", NULL, err, err_len) != 0) {
+        mcp_remove_tools_for_server(mcp, s->name);
         return -1;
     }
-    int rc = mcp_parse_tools_list_result(mcp, s->name, list_result, err, err_len);
-    free(list_result);
-    if (rc != 0) return -1;
+
+    if (mcp_server_list_all_tools(mcp, s, err, err_len) != 0) {
+        /* Drop any tools partially registered for this server. */
+        if (mcp->tool_count > tools_before)
+            mcp_remove_tools_for_server(mcp, s->name);
+        return -1;
+    }
     s->connected = true;
     return 0;
 }
@@ -1414,10 +1571,12 @@ static void mcp_schema_append_dsml_tool(mcp_buf *b, const mcp_tool *t) {
                  "{\n"
                  "  \"type\": \"function\",\n"
                  "  \"function\": {\n"
-                 "    \"name\": \"");
-    /* Names are restricted server__tool identifiers — no JSON escape needed. */
-    mcp_buf_puts(b, t->exposed_name);
-    mcp_buf_puts(b, "\",\n    \"description\": ");
+                 "    \"name\": ");
+    /* Validate-then-quote: names are restricted, but still JSON-escape. */
+    char *qname = mcp_json_quote(t->exposed_name ? t->exposed_name : "");
+    mcp_buf_puts(b, qname);
+    free(qname);
+    mcp_buf_puts(b, ",\n    \"description\": ");
     char *qdesc = mcp_json_quote(t->description && t->description[0] ?
                                  t->description : "MCP tool");
     mcp_buf_puts(b, qdesc);
@@ -1430,9 +1589,11 @@ static void mcp_schema_append_dsml_tool(mcp_buf *b, const mcp_tool *t) {
 }
 
 static void mcp_schema_append_glm_tool(mcp_buf *b, const mcp_tool *t) {
-    mcp_buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":\"");
-    mcp_buf_puts(b, t->exposed_name);
-    mcp_buf_puts(b, "\",\"description\":");
+    mcp_buf_puts(b, "{\"type\":\"function\",\"function\":{\"name\":");
+    char *qname = mcp_json_quote(t->exposed_name ? t->exposed_name : "");
+    mcp_buf_puts(b, qname);
+    free(qname);
+    mcp_buf_puts(b, ",\"description\":");
     char *qdesc = mcp_json_quote(t->description && t->description[0] ?
                                  t->description : "MCP tool");
     mcp_buf_puts(b, qdesc);
@@ -1606,6 +1767,7 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
         if (mcp_server_initialize(mcp, s, serr, sizeof(serr)) != 0) {
             snprintf(last_err, sizeof(last_err), "%s: %s", s->name, serr);
             mcp_log(mcp, "failed to initialize %s: %s", s->name, serr);
+            mcp_remove_tools_for_server(mcp, s->name);
             mcp_server_shutdown_runtime(s);
             s->disabled = true;
             continue;
@@ -1625,6 +1787,14 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
 
 int ds4_mcp_server_count(const ds4_mcp *mcp) {
     return mcp ? mcp->server_count : 0;
+}
+
+int ds4_mcp_connected_server_count(const ds4_mcp *mcp) {
+    if (!mcp) return 0;
+    int n = 0;
+    for (int i = 0; i < mcp->server_count; i++)
+        if (mcp->servers[i].connected) n++;
+    return n;
 }
 
 int ds4_mcp_tool_count(const ds4_mcp *mcp) {

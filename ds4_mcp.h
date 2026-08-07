@@ -38,8 +38,9 @@ void ds4_mcp_free(ds4_mcp *mcp);
 /* Spawn enabled servers, initialize, and list tools.  May prompt via confirm. */
 int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len);
 
-/* Number of connected servers / discovered tools. */
+/* Configured servers, currently connected servers, and discovered tools. */
 int ds4_mcp_server_count(const ds4_mcp *mcp);
+int ds4_mcp_connected_server_count(const ds4_mcp *mcp);
 int ds4_mcp_tool_count(const ds4_mcp *mcp);
 
 /* Build DSML or GLM schema text for discovered tools.  Caller frees. */
