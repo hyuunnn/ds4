@@ -144,7 +144,7 @@ typedef struct {
     bool web_approval_pending;
     bool web_approval_answered;
     bool web_approval_result;
-    char web_approval_message[256];
+    char web_approval_message[768];
     char web_approval_error[160];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
@@ -7174,7 +7174,7 @@ static void test_agent_mcp_helpers(void) {
     AGENT_TEST_ASSERT(strstr(json, "\"raw\":true") != NULL);
     free(json);
 
-    /* Free-text values must be quoted even when is_string is false (DSML default). */
+    /* Free-text values must be quoted when is_string is false if not JSON. */
     {
         const char *n2[] = { "path" };
         const char *v2[] = { "/tmp/a.apk" };
@@ -7183,14 +7183,23 @@ static void test_agent_mcp_helpers(void) {
         AGENT_TEST_ASSERT(strstr(j2, "\"path\":\"/tmp/a.apk\"") != NULL);
         free(j2);
     }
-    /* Numbers stay raw even when is_string is true (GLM default). */
+    /* Numbers stay raw only when is_string is false. */
     {
         const char *n2[] = { "count" };
         const char *v2[] = { "10" };
-        bool s2[] = { true };
+        bool s2[] = { false };
         char *j2 = ds4_mcp_build_args_json(n2, v2, s2, 1);
         AGENT_TEST_ASSERT(strstr(j2, "\"count\":10") != NULL);
         AGENT_TEST_ASSERT(strstr(j2, "\"count\":\"10\"") == NULL);
+        free(j2);
+    }
+    /* is_string=true always quotes, even numeric-looking text (string schemas). */
+    {
+        const char *n2[] = { "id" };
+        const char *v2[] = { "42" };
+        bool s2[] = { true };
+        char *j2 = ds4_mcp_build_args_json(n2, v2, s2, 1);
+        AGENT_TEST_ASSERT(strstr(j2, "\"id\":\"42\"") != NULL);
         free(j2);
     }
 

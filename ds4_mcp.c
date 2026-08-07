@@ -1002,7 +1002,6 @@ char *ds4_mcp_build_args_json(const char *const *names,
                               const char *const *values,
                               const bool *is_string,
                               int n) {
-    (void)is_string; /* Type is inferred from value shape for DSML/GLM safety. */
     mcp_buf b = {0};
     mcp_buf_puts(&b, "{");
     for (int i = 0; i < n; i++) {
@@ -1013,18 +1012,24 @@ char *ds4_mcp_build_args_json(const char *const *names,
         free(qk);
         mcp_buf_puts(&b, ":");
         const char *v = values[i] ? values[i] : "";
-        /* Prefer raw JSON for numbers/bools/null/objects/arrays. Always quote
-         * free text (paths, names, etc.), including when DSML omits string= or
-         * GLM marks every arg as a string. */
+        /*
+         * Honor the parser's is_string flag:
+         * - true  → always quote (DSML string="true", or GLM string args)
+         * - false → emit raw only when the text is already a full JSON value;
+         *           otherwise quote free text such as paths.
+         * Callers that hardcode is_string=true for every arg (legacy GLM path)
+         * should instead set the flag from value shape before calling this.
+         */
         bool as_string = true;
-        if (v[0] && v[0] != '"' && mcp_looks_like_json_value(v))
+        if (is_string && !is_string[i] &&
+            v[0] && v[0] != '"' && mcp_looks_like_json_value(v))
             as_string = false;
         if (as_string) {
             char *qv = mcp_json_quote(v);
             mcp_buf_puts(&b, qv);
             free(qv);
         } else {
-            mcp_buf_puts(&b, v);
+            mcp_buf_puts(&b, v[0] ? v : "null");
         }
     }
     mcp_buf_puts(&b, "}");
@@ -1050,10 +1055,17 @@ static int mcp_set_nonblock(int fd, bool on) {
     return fcntl(fd, F_SETFL, next);
 }
 
-static int mcp_write_all(int fd, const char *buf, size_t n) {
+static int mcp_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static int mcp_write_all(ds4_mcp *mcp, int fd, const char *buf, size_t n) {
     size_t off = 0;
     double deadline = (double)time(NULL) + (DS4_MCP_IO_TIMEOUT_MS / 1000.0) + 1.0;
     while (off < n) {
+        if (mcp_cancel(mcp)) return -1;
         ssize_t w = write(fd, buf + off, n - off);
         if (w < 0) {
             if (errno == EINTR) continue;
@@ -1078,7 +1090,8 @@ static int mcp_write_all(int fd, const char *buf, size_t n) {
     return 0;
 }
 
-static int mcp_server_send(mcp_server *s, const char *json, char *err, size_t err_len) {
+static int mcp_server_send(ds4_mcp *mcp, mcp_server *s, const char *json,
+                           char *err, size_t err_len) {
     if (!s || s->stdin_fd < 0) {
         mcp_set_err(err, err_len, "MCP server not connected");
         return -1;
@@ -1093,11 +1106,11 @@ static int mcp_server_send(mcp_server *s, const char *json, char *err, size_t er
         mcp_set_err(err, err_len, "MCP framing header failed");
         return -1;
     }
-    if (mcp_write_all(s->stdin_fd, header, (size_t)hlen) != 0 ||
-        mcp_write_all(s->stdin_fd, json, n) != 0)
+    if (mcp_write_all(mcp, s->stdin_fd, header, (size_t)hlen) != 0 ||
+        mcp_write_all(mcp, s->stdin_fd, json, n) != 0)
     {
         mcp_set_err(err, err_len, "MCP write failed: %s",
-                    errno ? strerror(errno) : "timeout or closed pipe");
+                    errno ? strerror(errno) : "timeout, closed pipe, or interrupted");
         return -1;
     }
     return 0;
@@ -1141,83 +1154,96 @@ static int mcp_server_read_more(mcp_server *s, int timeout_ms, char *err, size_t
 
 /* Try to extract one complete message from the receive buffer. */
 static char *mcp_server_take_message(mcp_server *s) {
-    if (!s->rx.ptr || s->rx.len == 0) return NULL;
+    for (;;) {
+        if (!s->rx.ptr || s->rx.len == 0) return NULL;
 
-    /* Content-Length framing only when the buffer starts with a header.
-     * Mid-buffer matches would desync if the server prints a banner. */
-    if (!strncmp(s->rx.ptr, "Content-Length:", 15) ||
-        !strncmp(s->rx.ptr, "content-length:", 15))
-    {
-        /* Find header end. */
-        char *hdr_end = strstr(s->rx.ptr, "\r\n\r\n");
-        size_t sep_len = 4;
-        if (!hdr_end) {
-            hdr_end = strstr(s->rx.ptr, "\n\n");
-            sep_len = 2;
-        }
-        if (!hdr_end) return NULL;
-
-        long content_len = -1;
-        const char *line = s->rx.ptr;
-        while (line < hdr_end) {
-            const char *nl = strstr(line, "\r\n");
-            size_t line_sep = 2;
-            if (!nl || nl > hdr_end) {
-                nl = strchr(line, '\n');
-                line_sep = 1;
-            }
-            if (!nl || nl > hdr_end) break;
-            if (!strncasecmp(line, "Content-Length:", 15)) {
-                content_len = strtol(line + 15, NULL, 10);
-            }
-            line = nl + line_sep;
-        }
-        if (content_len < 0 || content_len > DS4_MCP_MAX_MSG) {
-            /* Bad header: drop through the first line so we do not spin forever. */
-            char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
-            if (!nl) return NULL;
-            size_t drop = (size_t)(nl - s->rx.ptr) + 1;
-            memmove(s->rx.ptr, s->rx.ptr + drop, s->rx.len - drop);
-            s->rx.len -= drop;
+        /* Skip leading whitespace left after banners/partial drops. */
+        size_t lead = 0;
+        while (lead < s->rx.len &&
+               (s->rx.ptr[lead] == ' ' || s->rx.ptr[lead] == '\t' ||
+                s->rx.ptr[lead] == '\r' || s->rx.ptr[lead] == '\n'))
+            lead++;
+        if (lead) {
+            memmove(s->rx.ptr, s->rx.ptr + lead, s->rx.len - lead);
+            s->rx.len -= lead;
             s->rx.ptr[s->rx.len] = '\0';
-            return mcp_server_take_message(s);
+            if (s->rx.len == 0) return NULL;
         }
-        size_t header_total = (size_t)(hdr_end - s->rx.ptr) + sep_len;
-        if (s->rx.len < header_total + (size_t)content_len) return NULL;
-        char *msg = mcp_xmalloc((size_t)content_len + 1);
-        memcpy(msg, s->rx.ptr + header_total, (size_t)content_len);
-        msg[content_len] = '\0';
-        size_t remain = s->rx.len - header_total - (size_t)content_len;
-        memmove(s->rx.ptr, s->rx.ptr + header_total + (size_t)content_len, remain);
-        s->rx.len = remain;
-        s->rx.ptr[s->rx.len] = '\0';
-        return msg;
-    }
 
-    /* NDJSON: one JSON object per line.  Also skips non-JSON banner lines. */
-    char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
-    if (!nl) return NULL;
-    size_t line_len = (size_t)(nl - s->rx.ptr);
-    /* Trim CR */
-    size_t trim = line_len;
-    if (trim > 0 && s->rx.ptr[trim - 1] == '\r') trim--;
-    /* Skip blank / non-object lines (server logs before the first frame). */
-    if (trim == 0 || s->rx.ptr[0] != '{') {
+        /* Content-Length framing only when the buffer starts with a header. */
+        if (!strncmp(s->rx.ptr, "Content-Length:", 15) ||
+            !strncmp(s->rx.ptr, "content-length:", 15))
+        {
+            char *hdr_end = strstr(s->rx.ptr, "\r\n\r\n");
+            size_t sep_len = 4;
+            if (!hdr_end) {
+                hdr_end = strstr(s->rx.ptr, "\n\n");
+                sep_len = 2;
+            }
+            if (!hdr_end) return NULL;
+
+            long content_len = -1;
+            const char *line = s->rx.ptr;
+            while (line < hdr_end) {
+                const char *nl = strstr(line, "\r\n");
+                size_t line_sep = 2;
+                if (!nl || nl > hdr_end) {
+                    nl = strchr(line, '\n');
+                    line_sep = 1;
+                }
+                if (!nl || nl > hdr_end) break;
+                if (!strncasecmp(line, "Content-Length:", 15)) {
+                    content_len = strtol(line + 15, NULL, 10);
+                }
+                line = nl + line_sep;
+            }
+            if (content_len < 0 || content_len > DS4_MCP_MAX_MSG) {
+                /* Bad header: drop one line and retry without recursion. */
+                char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
+                if (!nl) return NULL;
+                size_t drop = (size_t)(nl - s->rx.ptr) + 1;
+                memmove(s->rx.ptr, s->rx.ptr + drop, s->rx.len - drop);
+                s->rx.len -= drop;
+                s->rx.ptr[s->rx.len] = '\0';
+                continue;
+            }
+            size_t header_total = (size_t)(hdr_end - s->rx.ptr) + sep_len;
+            if (s->rx.len < header_total + (size_t)content_len) return NULL;
+            char *msg = mcp_xmalloc((size_t)content_len + 1);
+            memcpy(msg, s->rx.ptr + header_total, (size_t)content_len);
+            msg[content_len] = '\0';
+            size_t remain = s->rx.len - header_total - (size_t)content_len;
+            memmove(s->rx.ptr, s->rx.ptr + header_total + (size_t)content_len, remain);
+            s->rx.len = remain;
+            s->rx.ptr[s->rx.len] = '\0';
+            return msg;
+        }
+
+        /* NDJSON: one JSON object per line. Drop non-object banner lines. */
+        char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
+        if (!nl) return NULL;
+        size_t line_len = (size_t)(nl - s->rx.ptr);
+        size_t trim = line_len;
+        if (trim > 0 && s->rx.ptr[trim - 1] == '\r') trim--;
+        if (trim == 0 || s->rx.ptr[0] != '{') {
+            size_t remain = s->rx.len - line_len - 1;
+            memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
+            s->rx.len = remain;
+            s->rx.ptr[s->rx.len] = '\0';
+            continue;
+        }
+        char *msg = mcp_xmalloc(trim + 1);
+        memcpy(msg, s->rx.ptr, trim);
+        msg[trim] = '\0';
         size_t remain = s->rx.len - line_len - 1;
         memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
         s->rx.len = remain;
         s->rx.ptr[s->rx.len] = '\0';
-        return mcp_server_take_message(s);
+        return msg;
     }
-    char *msg = mcp_xmalloc(trim + 1);
-    memcpy(msg, s->rx.ptr, trim);
-    msg[trim] = '\0';
-    size_t remain = s->rx.len - line_len - 1;
-    memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
-    s->rx.len = remain;
-    s->rx.ptr[s->rx.len] = '\0';
-    return msg;
 }
+
+static void mcp_server_drain_stderr(ds4_mcp *mcp, mcp_server *s);
 
 static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
                                       int timeout_ms, char *err, size_t err_len) {
@@ -1227,6 +1253,7 @@ static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
             mcp_set_err(err, err_len, "interrupted");
             return NULL;
         }
+        mcp_server_drain_stderr(mcp, s);
         char *msg = mcp_server_take_message(s);
         if (msg) {
             /* Notifications / unmatched messages are discarded for v1. */
@@ -1242,7 +1269,35 @@ static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
         int wait_ms = (int)((deadline - now) * 1000.0);
         if (wait_ms < 50) wait_ms = 50;
         if (wait_ms > 1000) wait_ms = 1000;
-        if (mcp_server_read_more(s, wait_ms, err, err_len) < 0) return NULL;
+
+        /* Poll stdout and stderr together so chatty servers cannot fill the
+         * stderr pipe and deadlock while we wait for a reply. */
+        struct pollfd pfds[2];
+        int nfds = 0;
+        int out_idx = -1, err_idx = -1;
+        if (s->stdout_fd >= 0) {
+            out_idx = nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = s->stdout_fd, .events = POLLIN };
+        }
+        if (s->stderr_fd >= 0) {
+            err_idx = nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = s->stderr_fd, .events = POLLIN };
+        }
+        if (nfds == 0) {
+            mcp_set_err(err, err_len, "MCP server stdout closed");
+            return NULL;
+        }
+        int pr = poll(pfds, (nfds_t)nfds, wait_ms);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            mcp_set_err(err, err_len, "MCP poll failed: %s", strerror(errno));
+            return NULL;
+        }
+        if (err_idx >= 0 && (pfds[err_idx].revents & (POLLIN | POLLHUP)))
+            mcp_server_drain_stderr(mcp, s);
+        if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLHUP))) {
+            if (mcp_server_read_more(s, 0, err, err_len) < 0) return NULL;
+        }
     }
 }
 
@@ -1263,7 +1318,7 @@ static char *mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
     mcp_buf_puts(&req, "}");
     char *wire = mcp_buf_take(&req);
     mcp_log(mcp, "mcp %s -> %s", s->name, method);
-    if (mcp_server_send(s, wire, err, err_len) != 0) {
+    if (mcp_server_send(mcp, s, wire, err, err_len) != 0) {
         free(wire);
         return NULL;
     }
@@ -1284,7 +1339,6 @@ static char *mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
 
 static int mcp_notify(ds4_mcp *mcp, mcp_server *s, const char *method,
                       const char *params_json, char *err, size_t err_len) {
-    (void)mcp;
     mcp_buf req = {0};
     char *qmethod = mcp_json_quote(method);
     mcp_buf_printf(&req, "{\"jsonrpc\":\"2.0\",\"method\":%s", qmethod);
@@ -1295,10 +1349,15 @@ static int mcp_notify(ds4_mcp *mcp, mcp_server *s, const char *method,
     }
     mcp_buf_puts(&req, "}");
     char *wire = mcp_buf_take(&req);
-    int rc = mcp_server_send(s, wire, err, err_len);
+    int rc = mcp_server_send(mcp, s, wire, err, err_len);
     free(wire);
     return rc;
 }
+
+static void mcp_server_drain_stderr(ds4_mcp *mcp, mcp_server *s);
+static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_len);
+static int mcp_server_initialize(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_len);
+static void mcp_remove_tools_for_server(ds4_mcp *mcp, const char *server_name);
 
 /* ============================================================================
  * Spawn / initialize / tools.list
@@ -1319,10 +1378,16 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         if (err_pipe[1] >= 0) close(err_pipe[1]);
         return -1;
     }
+    /* Parent keeps ends; child ends must not leak into bash/other forks. */
+    mcp_set_cloexec(in_pipe[0]);
+    mcp_set_cloexec(in_pipe[1]);
+    mcp_set_cloexec(out_pipe[0]);
+    mcp_set_cloexec(out_pipe[1]);
+    mcp_set_cloexec(err_pipe[0]);
+    mcp_set_cloexec(err_pipe[1]);
 
     /* Build argv in the parent so the child never mallocs after fork. */
-    int argv_n = s->argc + 2;
-    if (argv_n > DS4_MCP_MAX_ARGS + 2) {
+    if (s->argc + 2 > DS4_MCP_MAX_ARGS + 2) {
         mcp_set_err(err, err_len, "too many args");
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
@@ -1334,77 +1399,119 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     for (int i = 0; i < s->argc; i++) argv_stack[i + 1] = s->args[i];
     argv_stack[s->argc + 1] = NULL;
 
+    /*
+     * Build a complete envp in the parent (no setenv after fork).  Start from
+     * environ, then overlay server-specific KEY=VALUE entries.
+     */
+    extern char **environ;
+    int base_envc = 0;
+    if (environ) while (environ[base_envc]) base_envc++;
+    int env_total = base_envc + s->envc + 1;
+    char **envp = mcp_xmalloc((size_t)env_total * sizeof(char *));
+    char **overlay = NULL;
+    if (s->envc > 0) overlay = mcp_xmalloc((size_t)s->envc * sizeof(char *));
+    for (int i = 0; i < s->envc; i++) {
+        size_t kn = strlen(s->env[i].key ? s->env[i].key : "");
+        size_t vn = strlen(s->env[i].value ? s->env[i].value : "");
+        overlay[i] = mcp_xmalloc(kn + 1 + vn + 1);
+        snprintf(overlay[i], kn + 1 + vn + 1, "%s=%s",
+                 s->env[i].key ? s->env[i].key : "",
+                 s->env[i].value ? s->env[i].value : "");
+    }
+    int out_i = 0;
+    for (int i = 0; i < base_envc; i++) {
+        const char *e = environ[i];
+        const char *eq = strchr(e, '=');
+        size_t klen = eq ? (size_t)(eq - e) : strlen(e);
+        bool replaced = false;
+        for (int j = 0; j < s->envc; j++) {
+            const char *k = s->env[j].key ? s->env[j].key : "";
+            if (strlen(k) == klen && !strncmp(e, k, klen)) {
+                envp[out_i++] = overlay[j];
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) envp[out_i++] = (char *)e;
+    }
+    for (int j = 0; j < s->envc; j++) {
+        bool used = false;
+        for (int i = 0; i < out_i; i++) {
+            if (envp[i] == overlay[j]) { used = true; break; }
+        }
+        if (!used) envp[out_i++] = overlay[j];
+    }
+    envp[out_i] = NULL;
+
     pid_t pid = fork();
     if (pid < 0) {
         mcp_set_err(err, err_len, "fork failed: %s", strerror(errno));
+        for (int i = 0; i < s->envc; i++) free(overlay[i]);
+        free(overlay);
+        free(envp);
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
         return -1;
     }
     if (pid == 0) {
-        /* Child: own process group so shutdown can kill grandchildren. */
+        /* Child: only async-signal-safe calls until exec. */
         setpgid(0, 0);
-        close(in_pipe[1]);
-        close(out_pipe[0]);
-        close(err_pipe[0]);
+        /* Clear CLOEXEC on the ends we need after dup2. */
         if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
         if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
-        /* Keep stderr off the agent TTY; parent drains and logs it. */
         if (dup2(err_pipe[1], STDERR_FILENO) < 0) _exit(127);
-        close(in_pipe[0]);
-        close(out_pipe[1]);
-        close(err_pipe[1]);
+        /* Close the originals; CLOEXEC would also close them at exec. */
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
 
-        /* Drop inherited FDs (agent pipes, other MCP servers, model handles). */
         int maxfd = (int)sysconf(_SC_OPEN_MAX);
         if (maxfd < 0) maxfd = 1024;
-        /* Cap only the scan cost, not correctness: still try a high bound. */
         if (maxfd > 65536) maxfd = 65536;
         for (int fd = 3; fd < maxfd; fd++)
             close(fd);
 
-        for (int i = 0; i < s->envc; i++) {
-            if (s->env[i].key && s->env[i].value)
-                setenv(s->env[i].key, s->env[i].value, 1);
+        execve(s->command, argv_stack, envp);
+        /* PATH lookup: if command has no slash, fall back via /bin/sh -c is
+         * avoided; try execvpe when available. */
+#ifdef __APPLE__
+        /* macOS has execvP; use PATH from envp by walking it is heavy —
+         * re-exec through execvp only if command has no '/'. */
+#endif
+        if (!strchr(s->command, '/')) {
+            /* Build PATH search without setenv: use execvp which reads environ.
+             * We already closed extra FDs; still unsafe to touch malloc locks,
+             * but environ is already set from parent memory we inherit. */
+            /* Replace process environ pointer for PATH search. */
+            environ = envp;
+            execvp(s->command, argv_stack);
         }
-
-        execvp(s->command, argv_stack);
-        /* Avoid fprintf after fork in a multi-threaded parent. */
         const char *msg = "ds4_mcp: exec failed\n";
         (void)write(STDERR_FILENO, msg, 22);
         _exit(127);
     }
 
-    /* Parent: make sure the child is in its own process group even if it has
-     * not reached setpgid yet. */
+    /* Parent */
     setpgid(pid, pid);
+    for (int i = 0; i < s->envc; i++) free(overlay[i]);
+    free(overlay);
+    free(envp);
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
-    /* Drain child stderr asynchronously so the pipe never fills. */
-    if (mcp_set_nonblock(err_pipe[0], true) == 0) {
-        /* Best-effort: parent closes after a short non-blocking drain later
-         * via a detached reader thread would be ideal; for v1 just set CLOEXEC
-         * and close after spawn once we have logged any immediate banner. */
-        char banner[512];
-        ssize_t bn = read(err_pipe[0], banner, sizeof(banner) - 1);
-        if (bn > 0) {
-            banner[bn] = '\0';
-            /* Collapse to one log line. */
-            for (ssize_t i = 0; i < bn; i++)
-                if (banner[i] == '\n' || banner[i] == '\r') banner[i] = ' ';
-            mcp_log(mcp, "mcp %s stderr: %s", s->name, banner);
-        }
-    }
-    /* Keep stderr pipe open but nonblocking so the child never blocks on a full
-     * pipe; periodic drain happens before each RPC via mcp_server_drain_stderr. */
+
     s->stderr_fd = err_pipe[0];
     s->pid = pid;
     s->stdin_fd = in_pipe[1];
     s->stdout_fd = out_pipe[0];
     mcp_set_nonblock(s->stdout_fd, true);
     mcp_set_nonblock(s->stdin_fd, true);
+    mcp_set_nonblock(s->stderr_fd, true);
+    mcp_set_cloexec(s->stdin_fd);
+    mcp_set_cloexec(s->stdout_fd);
+    mcp_set_cloexec(s->stderr_fd);
+    mcp_server_drain_stderr(mcp, s);
     mcp_log(mcp, "spawned MCP server %s pid=%ld cmd=%s",
             s->name, (long)pid, s->command);
     return 0;
@@ -1529,7 +1636,18 @@ static int mcp_parse_tools_array(ds4_mcp *mcp, const char *server_name,
         int rc = mcp_tool_add(mcp, server_name, name, desc, schema_json,
                               add_err, sizeof(add_err));
         if (rc != 0) {
-            /* Skip bad individual tools; do not abort the whole server. */
+            /* Soft-skip only invalid names / bad schema tools. Hard limits and
+             * duplicates abort listing so the operator sees a real error. */
+            bool hard = strstr(add_err, "too many MCP tools") != NULL ||
+                        strstr(add_err, "duplicate MCP tool") != NULL;
+            if (hard) {
+                free(name);
+                free(desc);
+                free(schema_json);
+                free(obj);
+                mcp_set_err(err, err_len, "%s", add_err);
+                return -1;
+            }
             mcp_log(mcp, "mcp %s: skipping tool: %s",
                     server_name ? server_name : "?",
                     add_err[0] ? add_err : "invalid tool");
@@ -1858,13 +1976,27 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
         mcp_set_err(err, err_len, "null MCP client");
         return -1;
     }
-    if (mcp->connected) return 0;
+
+    int need = 0;
+    for (int i = 0; i < mcp->server_count; i++) {
+        mcp_server *s = &mcp->servers[i];
+        if (!s->disabled && !s->connected) need++;
+    }
+    if (need == 0) {
+        /* All enabled servers already live. */
+        if (ds4_mcp_connected_server_count(mcp) > 0) {
+            mcp->connected = true;
+            return 0;
+        }
+        mcp_set_err(err, err_len, "no enabled MCP servers in config");
+        return -1;
+    }
 
     int enabled = 0;
     mcp_buf summary = {0};
     for (int i = 0; i < mcp->server_count; i++) {
         mcp_server *s = &mcp->servers[i];
-        if (s->disabled) continue;
+        if (s->disabled || s->connected) continue;
         if (enabled++) mcp_buf_puts(&summary, ", ");
         mcp_buf_puts(&summary, s->name);
         mcp_buf_puts(&summary, " (");
@@ -1877,14 +2009,15 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
     }
     char *summary_s = mcp_buf_take(&summary);
 
-    if (!mcp->auto_approve) {
+    if (!mcp->auto_approve && !mcp->connected) {
+        /* Only prompt once for the first connect wave. */
         if (!mcp->confirm) {
             free(summary_s);
             mcp_set_err(err, err_len,
                         "MCP connection requires interactive approval");
             return -1;
         }
-        char prompt[512];
+        char prompt[768];
         snprintf(prompt, sizeof(prompt),
                  "Start MCP server%s %s? (y/n) ",
                  enabled == 1 ? "" : "s", summary_s);
@@ -1896,16 +2029,18 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
             free(summary_s);
             return -1;
         }
-    } else {
+    } else if (!mcp->connected) {
         mcp_log(mcp, "auto-approving MCP servers: %s", summary_s);
+    } else {
+        mcp_log(mcp, "retrying MCP servers: %s", summary_s);
     }
     free(summary_s);
 
-    int connected = 0;
+    int connected_now = 0;
     char last_err[256] = {0};
     for (int i = 0; i < mcp->server_count; i++) {
         mcp_server *s = &mcp->servers[i];
-        if (s->disabled) continue;
+        if (s->disabled || s->connected) continue;
         char serr[160] = {0};
         if (mcp_server_spawn(mcp, s, serr, sizeof(serr)) != 0) {
             snprintf(last_err, sizeof(last_err), "%s: %s", s->name, serr);
@@ -1917,19 +2052,24 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
             mcp_log(mcp, "failed to initialize %s: %s", s->name, serr);
             mcp_remove_tools_for_server(mcp, s->name);
             mcp_server_shutdown_runtime(s);
-            /* Do not flip config disabled: allow a later connect retry. */
             continue;
         }
-        connected++;
+        connected_now++;
         mcp_log(mcp, "MCP server %s ready with tools", s->name);
     }
 
-    if (connected == 0) {
+    int total = ds4_mcp_connected_server_count(mcp);
+    if (total == 0) {
+        mcp->connected = false;
         mcp_set_err(err, err_len, "no MCP servers connected%s%s",
                     last_err[0] ? ": " : "", last_err);
         return -1;
     }
     mcp->connected = true;
+    if (connected_now == 0 && need > 0) {
+        /* Already had some servers; retry wave added none. Not fatal. */
+        mcp_log(mcp, "MCP retry did not recover any additional servers");
+    }
     return 0;
 }
 
@@ -1966,9 +2106,6 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         mcp_set_err(err, err_len, "invalid MCP tool call");
         return NULL;
     }
-    if (!mcp->connected) {
-        if (ds4_mcp_connect(mcp, err, err_len) != 0) return NULL;
-    }
 
     char server[DS4_MCP_MAX_SERVER_NAME + 1];
     char tool[DS4_MCP_MAX_TOOL_NAME + 1];
@@ -1981,14 +2118,29 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
 
     mcp_server *s = NULL;
     for (int i = 0; i < mcp->server_count; i++) {
-        if (mcp->servers[i].name && !strcmp(mcp->servers[i].name, server) &&
-            mcp->servers[i].connected)
-        {
+        if (mcp->servers[i].name && !strcmp(mcp->servers[i].name, server)) {
             s = &mcp->servers[i];
             break;
         }
     }
-    if (!s) {
+    if (!s || s->disabled) {
+        mcp_set_err(err, err_len, "unknown MCP server: %s", server);
+        return NULL;
+    }
+
+    /* Reconnect this server if it died or never started. */
+    if (!s->connected) {
+        char cerr[192] = {0};
+        if (ds4_mcp_connect(mcp, cerr, sizeof(cerr)) != 0 && !s->connected) {
+            mcp_set_err(err, err_len, "MCP server not connected: %s%s%s",
+                        server, cerr[0] ? " (" : "", cerr[0] ? cerr : "");
+            if (cerr[0]) {
+                /* keep message compact */
+            }
+            return NULL;
+        }
+    }
+    if (!s->connected) {
         mcp_set_err(err, err_len, "MCP server not connected: %s", server);
         return NULL;
     }
@@ -2022,7 +2174,14 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
     char *resp = mcp_rpc(mcp, s, "tools/call", params_s, err, err_len);
     pthread_mutex_unlock(&mcp->mu);
     free(params_s);
-    if (!resp) return NULL;
+    if (!resp) {
+        /* Transport failure: drop runtime so a later call can respawn. */
+        mcp_remove_tools_for_server(mcp, s->name);
+        mcp_server_shutdown_runtime(s);
+        if (ds4_mcp_connected_server_count(mcp) == 0)
+            mcp->connected = false;
+        return NULL;
+    }
 
     char *result = mcp_json_get_result_raw(resp);
     free(resp);
