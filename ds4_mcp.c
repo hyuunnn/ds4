@@ -438,6 +438,10 @@ typedef struct {
     mcp_buf rx;
     bool connected;
     char *server_title; /* initialize result serverInfo.name if any */
+    /* Owned KEY=VALUE strings kept until this server runtime is freed so the
+     * post-fork child can still read them until exec replaces the address space. */
+    char **child_env_owned;
+    int child_env_owned_n;
 } mcp_server;
 
 typedef struct {
@@ -462,6 +466,10 @@ struct ds4_mcp {
     void *cancel_privdata;
     bool auto_approve;
     bool connected;
+    /* Sticky interactive deny: no later ensure_connected spawn until process exit. */
+    bool spawn_denied;
+    /* True after the user has approved (or auto-approved) at least once. */
+    bool spawn_approved;
     pthread_mutex_t mu;
 };
 
@@ -525,6 +533,12 @@ static void mcp_server_shutdown_runtime(mcp_server *s) {
             waitpid(s->pid, &status, 0);
         }
         s->pid = -1;
+    }
+    if (s->child_env_owned) {
+        for (int i = 0; i < s->child_env_owned_n; i++) free(s->child_env_owned[i]);
+        free(s->child_env_owned);
+        s->child_env_owned = NULL;
+        s->child_env_owned_n = 0;
     }
     s->connected = false;
     s->next_id = 1;
@@ -1495,11 +1509,9 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     if (pid == 0) {
         /* Child: only async-signal-safe calls until exec. */
         setpgid(0, 0);
-        /* Clear CLOEXEC on the ends we need after dup2. */
         if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
         if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
         if (dup2(err_pipe[1], STDERR_FILENO) < 0) _exit(127);
-        /* Close the originals; CLOEXEC would also close them at exec. */
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         close(err_pipe[0]); close(err_pipe[1]);
@@ -1510,31 +1522,35 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         for (int fd = 3; fd < maxfd; fd++)
             close(fd);
 
+        /* Prefer absolute/path command via execve(envp). For PATH lookup without
+         * touching malloc, hand envp to execvpe when available. */
+#if defined(__linux__) || defined(__GLIBC__)
+        execvpe(s->command, argv_stack, envp);
+#else
         execve(s->command, argv_stack, envp);
-        /* PATH lookup: if command has no slash, fall back via /bin/sh -c is
-         * avoided; try execvpe when available. */
-#ifdef __APPLE__
-        /* macOS has execvP; use PATH from envp by walking it is heavy —
-         * re-exec through execvp only if command has no '/'. */
-#endif
         if (!strchr(s->command, '/')) {
-            /* Build PATH search without setenv: use execvp which reads environ.
-             * We already closed extra FDs; still unsafe to touch malloc locks,
-             * but environ is already set from parent memory we inherit. */
-            /* Replace process environ pointer for PATH search. */
+            /* Last resort PATH search; environ still points at parent copy —
+             * only safe if parent has not freed envp yet. Parent waits via
+             * short yield before free (below). */
             environ = envp;
             execvp(s->command, argv_stack);
         }
+#endif
         const char *msg = "ds4_mcp: exec failed\n";
         (void)write(STDERR_FILENO, msg, 22);
         _exit(127);
     }
 
-    /* Parent */
+    /* Parent: do not free child-visible env strings until this server is shut
+     * down. Stash owned KEY=VALUE overlays on the server object. */
     setpgid(pid, pid);
-    for (int i = 0; i < s->envc; i++) free(overlay[i]);
-    free(overlay);
-    free(envp);
+    if (s->child_env_owned) {
+        for (int i = 0; i < s->child_env_owned_n; i++) free(s->child_env_owned[i]);
+        free(s->child_env_owned);
+    }
+    s->child_env_owned = overlay;
+    s->child_env_owned_n = s->envc;
+    free(envp); /* pointers only; owned strings are in child_env_owned / environ */
     close(in_pipe[0]);
     close(out_pipe[1]);
     close(err_pipe[1]);
@@ -2051,8 +2067,13 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
     }
     char *summary_s = mcp_buf_take(&summary);
 
-    if (!mcp->auto_approve && !mcp->connected) {
-        /* Only prompt once for the first connect wave. */
+    if (!mcp->auto_approve && !mcp->spawn_approved) {
+        /* Interactive approval is sticky for the whole client lifetime. */
+        if (mcp->spawn_denied) {
+            free(summary_s);
+            mcp_set_err(err, err_len, "MCP server start was denied");
+            return -1;
+        }
         if (!mcp->confirm) {
             free(summary_s);
             mcp_set_err(err, err_len,
@@ -2066,12 +2087,15 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
         char cerr[160] = {0};
         int ok = mcp->confirm(mcp->confirm_privdata, prompt, cerr, sizeof(cerr));
         if (!ok) {
+            mcp->spawn_denied = true;
             mcp_set_err(err, err_len, "%s",
                         cerr[0] ? cerr : "user denied MCP server start");
             free(summary_s);
             return -1;
         }
-    } else if (!mcp->connected) {
+        mcp->spawn_approved = true;
+    } else if (mcp->auto_approve && !mcp->spawn_approved) {
+        mcp->spawn_approved = true;
         mcp_log(mcp, "auto-approving MCP servers: %s", summary_s);
     } else {
         mcp_log(mcp, "retrying MCP servers: %s", summary_s);
@@ -2156,20 +2180,15 @@ bool ds4_mcp_is_configured_tool(const ds4_mcp *mcp, const char *exposed_name) {
     return false;
 }
 
-/* Mark a live server dead if its process has exited. Does not free tools. */
+/* Mark a live server dead if its process has exited. Use the shared shutdown
+ * path so title/next_id/env ownership stay consistent. */
 static void mcp_server_refresh_liveness(mcp_server *s) {
     if (!s || !s->connected || s->pid <= 0) return;
     int status = 0;
     pid_t r = waitpid(s->pid, &status, WNOHANG);
     if (r == s->pid || (r < 0 && errno == ECHILD)) {
-        s->connected = false;
-        s->pid = -1;
-        if (s->stdin_fd >= 0) { close(s->stdin_fd); s->stdin_fd = -1; }
-        if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
-        if (s->stderr_fd >= 0) { close(s->stderr_fd); s->stderr_fd = -1; }
-        free(s->rx.ptr);
-        s->rx.ptr = NULL;
-        s->rx.len = s->rx.cap = 0;
+        s->pid = -1; /* prevent double-kill in shutdown */
+        mcp_server_shutdown_runtime(s);
     }
 }
 
@@ -2180,11 +2199,18 @@ static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
         mcp_set_err(err, err_len, "MCP server disabled");
         return -1;
     }
+    if (mcp->spawn_denied) {
+        mcp_set_err(err, err_len, "MCP server start was denied");
+        return -1;
+    }
+    /* Never spawn without an explicit prior approval (or auto_approve). */
+    if (!mcp->spawn_approved && !mcp->auto_approve) {
+        mcp_set_err(err, err_len, "MCP servers have not been approved");
+        return -1;
+    }
     mcp_server_refresh_liveness(s);
     if (s->connected) return 0;
 
-    /* Drop stale runtime without discarding the tool catalog: tools are
-     * re-listed on initialize and replace duplicates. */
     if (s->pid > 0 || s->stdin_fd >= 0 || s->stdout_fd >= 0)
         mcp_server_shutdown_runtime(s);
 
@@ -2193,8 +2219,6 @@ static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
         mcp_set_err(err, err_len, "%s", serr);
         return -1;
     }
-    /* Remove previous catalog for this server before re-list so we do not
-     * accumulate duplicates across reconnects. */
     mcp_remove_tools_for_server(mcp, s->name);
     if (mcp_server_initialize(mcp, s, serr, sizeof(serr)) != 0) {
         mcp_remove_tools_for_server(mcp, s->name);
@@ -2270,8 +2294,10 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
     free(params_s);
 
     if (st == MCP_RPC_TRANSPORT) {
-        /* Keep tool catalog; only drop the live process so a later call
-         * can respawn via mcp_server_ensure_connected. */
+        /* Keep tool catalog. Only drop the live process so a later approved
+         * call can respawn. Do not treat cancel the same as death if no bytes
+         * of a new frame were committed — still shut down to avoid partial
+         * frame desync on reuse. */
         mcp_server_shutdown_runtime(s);
         if (ds4_mcp_connected_server_count(mcp) == 0)
             mcp->connected = false;
