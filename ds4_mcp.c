@@ -27,8 +27,11 @@
 #define DS4_MCP_MAX_TOOLS 512
 #define DS4_MCP_MAX_ENV 64
 #define DS4_MCP_MAX_ARGS 64
+#define DS4_MCP_MAX_SERVER_NAME 64
+#define DS4_MCP_MAX_TOOL_NAME 128
 #define DS4_MCP_IO_TIMEOUT_MS 30000
 #define DS4_MCP_MAX_MSG (16 * 1024 * 1024)
+#define DS4_MCP_MAX_LIST_PAGES 64
 
 /* ============================================================================
  * Small utilities
@@ -372,6 +375,14 @@ static bool mcp_json_id_matches(const char *json, int id) {
     const char *v = mcp_json_obj_get(json, "id", &end);
     if (!v) return false;
     while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+    /* Accept both numeric ids and the common string form "id":"1". */
+    if (*v == '"') {
+        char *s = mcp_json_parse_string_at(v, NULL);
+        if (!s) return false;
+        bool ok = atoi(s) == id;
+        free(s);
+        return ok;
+    }
     return atoi(v) == id;
 }
 
@@ -422,6 +433,7 @@ typedef struct {
     pid_t pid;
     int stdin_fd;
     int stdout_fd;
+    int stderr_fd;
     int next_id;
     mcp_buf rx;
     bool connected;
@@ -493,6 +505,10 @@ static void mcp_server_shutdown_runtime(mcp_server *s) {
         close(s->stdout_fd);
         s->stdout_fd = -1;
     }
+    if (s->stderr_fd >= 0) {
+        close(s->stderr_fd);
+        s->stderr_fd = -1;
+    }
     if (s->pid > 0) {
         /* Kill the process group so npx/node wrappers and their children die. */
         kill(-s->pid, SIGTERM);
@@ -529,6 +545,7 @@ static void mcp_server_clear(mcp_server *s) {
     memset(s, 0, sizeof(*s));
     s->stdin_fd = -1;
     s->stdout_fd = -1;
+    s->stderr_fd = -1;
     s->pid = -1;
 }
 
@@ -560,22 +577,43 @@ static bool mcp_is_ident_char(char c) {
 /* Server keys must not contain "__" so exposed names server__tool split cleanly. */
 static bool mcp_valid_server_name(const char *name) {
     if (!name || !name[0]) return false;
-    for (const char *p = name; *p; p++) {
+    size_t n = 0;
+    for (const char *p = name; *p; p++, n++) {
+        if (n >= DS4_MCP_MAX_SERVER_NAME) return false;
         if (!mcp_is_ident_char(*p)) return false;
         if (p[0] == '_' && p[1] == '_') return false;
     }
     return true;
 }
 
-/* Tool names may use a slightly wider set; still no "__" and must be JSON-safe
- * identifiers we can embed without escaping surprises. */
+/* Tool names: same charset, no "__", bounded length for call_tool split buffers. */
 static bool mcp_valid_tool_name(const char *name) {
     if (!name || !name[0]) return false;
-    for (const char *p = name; *p; p++) {
+    size_t n = 0;
+    for (const char *p = name; *p; p++, n++) {
+        if (n >= DS4_MCP_MAX_TOOL_NAME) return false;
         if (!mcp_is_ident_char(*p)) return false;
         if (p[0] == '_' && p[1] == '_') return false;
     }
     return true;
+}
+
+/* True when s is a complete JSON value (number/bool/null/object/array). */
+static bool mcp_looks_like_json_value(const char *s) {
+    if (!s || !s[0]) return false;
+    const char *end = mcp_json_skip_value(s);
+    if (!end) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    return *end == '\0';
+}
+
+/* True when schema is a single JSON object we can splice into tool listings. */
+static bool mcp_schema_is_safe_object(const char *schema) {
+    if (!schema) return false;
+    const char *p = schema;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '{') return false;
+    return mcp_looks_like_json_value(p);
 }
 
 static int mcp_parse_string_array(const char *arr, char ***out_v, int *out_n,
@@ -845,6 +883,7 @@ static int mcp_add_server_from_obj(ds4_mcp *mcp, const char *name,
     s->disabled = disabled;
     s->stdin_fd = -1;
     s->stdout_fd = -1;
+    s->stderr_fd = -1;
     s->pid = -1;
     s->next_id = 1;
     return 0;
@@ -963,6 +1002,7 @@ char *ds4_mcp_build_args_json(const char *const *names,
                               const char *const *values,
                               const bool *is_string,
                               int n) {
+    (void)is_string; /* Type is inferred from value shape for DSML/GLM safety. */
     mcp_buf b = {0};
     mcp_buf_puts(&b, "{");
     for (int i = 0; i < n; i++) {
@@ -972,13 +1012,18 @@ char *ds4_mcp_build_args_json(const char *const *names,
         mcp_buf_puts(&b, qk);
         free(qk);
         mcp_buf_puts(&b, ":");
-        if (is_string && is_string[i]) {
-            char *qv = mcp_json_quote(values[i] ? values[i] : "");
+        const char *v = values[i] ? values[i] : "";
+        /* Prefer raw JSON for numbers/bools/null/objects/arrays. Always quote
+         * free text (paths, names, etc.), including when DSML omits string= or
+         * GLM marks every arg as a string. */
+        bool as_string = true;
+        if (v[0] && v[0] != '"' && mcp_looks_like_json_value(v))
+            as_string = false;
+        if (as_string) {
+            char *qv = mcp_json_quote(v);
             mcp_buf_puts(&b, qv);
             free(qv);
         } else {
-            const char *v = values[i] && values[i][0] ? values[i] : "null";
-            /* Non-string tool args are already JSON text (numbers/bools/objects). */
             mcp_buf_puts(&b, v);
         }
     }
@@ -991,6 +1036,13 @@ char *ds4_mcp_build_args_json(const char *const *names,
  * ============================================================================
  */
 
+static void mcp_ignore_sigpipe_once(void) {
+    static int done = 0;
+    if (done) return;
+    signal(SIGPIPE, SIG_IGN);
+    done = 1;
+}
+
 static int mcp_set_nonblock(int fd, bool on) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
@@ -1000,13 +1052,22 @@ static int mcp_set_nonblock(int fd, bool on) {
 
 static int mcp_write_all(int fd, const char *buf, size_t n) {
     size_t off = 0;
+    double deadline = (double)time(NULL) + (DS4_MCP_IO_TIMEOUT_MS / 1000.0) + 1.0;
     while (off < n) {
         ssize_t w = write(fd, buf + off, n - off);
         if (w < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                double now = (double)time(NULL);
+                if (now >= deadline) return -1;
+                int wait_ms = (int)((deadline - now) * 1000.0);
+                if (wait_ms < 50) wait_ms = 50;
+                if (wait_ms > 1000) wait_ms = 1000;
                 struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-                if (poll(&pfd, 1, DS4_MCP_IO_TIMEOUT_MS) <= 0) return -1;
+                if (poll(&pfd, 1, wait_ms) < 0) {
+                    if (errno == EINTR) continue;
+                    return -1;
+                }
                 continue;
             }
             return -1;
@@ -1022,6 +1083,7 @@ static int mcp_server_send(mcp_server *s, const char *json, char *err, size_t er
         mcp_set_err(err, err_len, "MCP server not connected");
         return -1;
     }
+    mcp_ignore_sigpipe_once();
     size_t n = strlen(json);
     /* Prefer Content-Length framing (MCP stdio standard). */
     char header[64];
@@ -1034,7 +1096,8 @@ static int mcp_server_send(mcp_server *s, const char *json, char *err, size_t er
     if (mcp_write_all(s->stdin_fd, header, (size_t)hlen) != 0 ||
         mcp_write_all(s->stdin_fd, json, n) != 0)
     {
-        mcp_set_err(err, err_len, "MCP write failed: %s", strerror(errno));
+        mcp_set_err(err, err_len, "MCP write failed: %s",
+                    errno ? strerror(errno) : "timeout or closed pipe");
         return -1;
     }
     return 0;
@@ -1080,11 +1143,10 @@ static int mcp_server_read_more(mcp_server *s, int timeout_ms, char *err, size_t
 static char *mcp_server_take_message(mcp_server *s) {
     if (!s->rx.ptr || s->rx.len == 0) return NULL;
 
-    /* Content-Length framing */
+    /* Content-Length framing only when the buffer starts with a header.
+     * Mid-buffer matches would desync if the server prints a banner. */
     if (!strncmp(s->rx.ptr, "Content-Length:", 15) ||
-        !strncmp(s->rx.ptr, "content-length:", 15) ||
-        strstr(s->rx.ptr, "\nContent-Length:") ||
-        strstr(s->rx.ptr, "\ncontent-length:"))
+        !strncmp(s->rx.ptr, "content-length:", 15))
     {
         /* Find header end. */
         char *hdr_end = strstr(s->rx.ptr, "\r\n\r\n");
@@ -1110,7 +1172,16 @@ static char *mcp_server_take_message(mcp_server *s) {
             }
             line = nl + line_sep;
         }
-        if (content_len < 0 || content_len > DS4_MCP_MAX_MSG) return NULL;
+        if (content_len < 0 || content_len > DS4_MCP_MAX_MSG) {
+            /* Bad header: drop through the first line so we do not spin forever. */
+            char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
+            if (!nl) return NULL;
+            size_t drop = (size_t)(nl - s->rx.ptr) + 1;
+            memmove(s->rx.ptr, s->rx.ptr + drop, s->rx.len - drop);
+            s->rx.len -= drop;
+            s->rx.ptr[s->rx.len] = '\0';
+            return mcp_server_take_message(s);
+        }
         size_t header_total = (size_t)(hdr_end - s->rx.ptr) + sep_len;
         if (s->rx.len < header_total + (size_t)content_len) return NULL;
         char *msg = mcp_xmalloc((size_t)content_len + 1);
@@ -1123,15 +1194,15 @@ static char *mcp_server_take_message(mcp_server *s) {
         return msg;
     }
 
-    /* NDJSON: one JSON object per line. */
+    /* NDJSON: one JSON object per line.  Also skips non-JSON banner lines. */
     char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
     if (!nl) return NULL;
     size_t line_len = (size_t)(nl - s->rx.ptr);
     /* Trim CR */
     size_t trim = line_len;
     if (trim > 0 && s->rx.ptr[trim - 1] == '\r') trim--;
-    /* Skip blank lines */
-    if (trim == 0) {
+    /* Skip blank / non-object lines (server logs before the first frame). */
+    if (trim == 0 || s->rx.ptr[0] != '{') {
         size_t remain = s->rx.len - line_len - 1;
         memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
         s->rx.len = remain;
@@ -1237,22 +1308,38 @@ static int mcp_notify(ds4_mcp *mcp, mcp_server *s, const char *method,
 static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_len) {
     int in_pipe[2] = { -1, -1 };
     int out_pipe[2] = { -1, -1 };
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
+    int err_pipe[2] = { -1, -1 };
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
         mcp_set_err(err, err_len, "pipe failed: %s", strerror(errno));
         if (in_pipe[0] >= 0) close(in_pipe[0]);
         if (in_pipe[1] >= 0) close(in_pipe[1]);
         if (out_pipe[0] >= 0) close(out_pipe[0]);
         if (out_pipe[1] >= 0) close(out_pipe[1]);
+        if (err_pipe[0] >= 0) close(err_pipe[0]);
+        if (err_pipe[1] >= 0) close(err_pipe[1]);
         return -1;
     }
+
+    /* Build argv in the parent so the child never mallocs after fork. */
+    int argv_n = s->argc + 2;
+    if (argv_n > DS4_MCP_MAX_ARGS + 2) {
+        mcp_set_err(err, err_len, "too many args");
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        return -1;
+    }
+    char *argv_stack[DS4_MCP_MAX_ARGS + 2];
+    argv_stack[0] = s->command;
+    for (int i = 0; i < s->argc; i++) argv_stack[i + 1] = s->args[i];
+    argv_stack[s->argc + 1] = NULL;
 
     pid_t pid = fork();
     if (pid < 0) {
         mcp_set_err(err, err_len, "fork failed: %s", strerror(errno));
-        close(in_pipe[0]);
-        close(in_pipe[1]);
-        close(out_pipe[0]);
-        close(out_pipe[1]);
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
         return -1;
     }
     if (pid == 0) {
@@ -1260,15 +1347,20 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
         setpgid(0, 0);
         close(in_pipe[1]);
         close(out_pipe[0]);
+        close(err_pipe[0]);
         if (dup2(in_pipe[0], STDIN_FILENO) < 0) _exit(127);
         if (dup2(out_pipe[1], STDOUT_FILENO) < 0) _exit(127);
-        /* Leave stderr shared so server logs are visible. */
+        /* Keep stderr off the agent TTY; parent drains and logs it. */
+        if (dup2(err_pipe[1], STDERR_FILENO) < 0) _exit(127);
         close(in_pipe[0]);
         close(out_pipe[1]);
+        close(err_pipe[1]);
 
         /* Drop inherited FDs (agent pipes, other MCP servers, model handles). */
         int maxfd = (int)sysconf(_SC_OPEN_MAX);
-        if (maxfd < 0 || maxfd > 1024) maxfd = 1024;
+        if (maxfd < 0) maxfd = 1024;
+        /* Cap only the scan cost, not correctness: still try a high bound. */
+        if (maxfd > 65536) maxfd = 65536;
         for (int fd = 3; fd < maxfd; fd++)
             close(fd);
 
@@ -1277,14 +1369,10 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
                 setenv(s->env[i].key, s->env[i].value, 1);
         }
 
-        /* argv: command + args */
-        char **argv = mcp_xmalloc((size_t)(s->argc + 2) * sizeof(char *));
-        argv[0] = s->command;
-        for (int i = 0; i < s->argc; i++) argv[i + 1] = s->args[i];
-        argv[s->argc + 1] = NULL;
-        execvp(s->command, argv);
-        fprintf(stderr, "ds4_mcp: failed to exec %s: %s\n",
-                s->command, strerror(errno));
+        execvp(s->command, argv_stack);
+        /* Avoid fprintf after fork in a multi-threaded parent. */
+        const char *msg = "ds4_mcp: exec failed\n";
+        (void)write(STDERR_FILENO, msg, 22);
         _exit(127);
     }
 
@@ -1293,10 +1381,30 @@ static int mcp_server_spawn(ds4_mcp *mcp, mcp_server *s, char *err, size_t err_l
     setpgid(pid, pid);
     close(in_pipe[0]);
     close(out_pipe[1]);
+    close(err_pipe[1]);
+    /* Drain child stderr asynchronously so the pipe never fills. */
+    if (mcp_set_nonblock(err_pipe[0], true) == 0) {
+        /* Best-effort: parent closes after a short non-blocking drain later
+         * via a detached reader thread would be ideal; for v1 just set CLOEXEC
+         * and close after spawn once we have logged any immediate banner. */
+        char banner[512];
+        ssize_t bn = read(err_pipe[0], banner, sizeof(banner) - 1);
+        if (bn > 0) {
+            banner[bn] = '\0';
+            /* Collapse to one log line. */
+            for (ssize_t i = 0; i < bn; i++)
+                if (banner[i] == '\n' || banner[i] == '\r') banner[i] = ' ';
+            mcp_log(mcp, "mcp %s stderr: %s", s->name, banner);
+        }
+    }
+    /* Keep stderr pipe open but nonblocking so the child never blocks on a full
+     * pipe; periodic drain happens before each RPC via mcp_server_drain_stderr. */
+    s->stderr_fd = err_pipe[0];
     s->pid = pid;
     s->stdin_fd = in_pipe[1];
     s->stdout_fd = out_pipe[0];
     mcp_set_nonblock(s->stdout_fd, true);
+    mcp_set_nonblock(s->stdin_fd, true);
     mcp_log(mcp, "spawned MCP server %s pid=%ld cmd=%s",
             s->name, (long)pid, s->command);
     return 0;
@@ -1321,6 +1429,22 @@ static void mcp_remove_tools_for_server(ds4_mcp *mcp, const char *server_name) {
     mcp->tool_count = w;
 }
 
+static void mcp_server_drain_stderr(ds4_mcp *mcp, mcp_server *s) {
+    if (!s || s->stderr_fd < 0) return;
+    char buf[1024];
+    for (;;) {
+        ssize_t n = read(s->stderr_fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            for (ssize_t i = 0; i < n; i++)
+                if (buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
+            mcp_log(mcp, "mcp %s stderr: %s", s->name ? s->name : "?", buf);
+            continue;
+        }
+        break;
+    }
+}
+
 static int mcp_tool_add(ds4_mcp *mcp, const char *server_name,
                         const char *tool_name, const char *description,
                         const char *input_schema_json,
@@ -1329,8 +1453,9 @@ static int mcp_tool_add(ds4_mcp *mcp, const char *server_name,
     if (!mcp_valid_tool_name(tool_name)) {
         mcp_set_err(err, err_len,
                     "invalid MCP tool name from %s: %s "
-                    "(use [A-Za-z0-9_.-], no \"__\")",
-                    server_name ? server_name : "?", tool_name);
+                    "(use [A-Za-z0-9_.-], no \"__\", max %d chars)",
+                    server_name ? server_name : "?", tool_name,
+                    DS4_MCP_MAX_TOOL_NAME);
         return -1;
     }
     if (mcp->tool_count >= DS4_MCP_MAX_TOOLS) {
@@ -1355,8 +1480,15 @@ static int mcp_tool_add(ds4_mcp *mcp, const char *server_name,
     t->tool_name = mcp_xstrdup(tool_name);
     t->exposed_name = exposed;
     t->description = description ? mcp_xstrdup(description) : mcp_xstrdup("");
-    t->input_schema_json = input_schema_json ? mcp_xstrdup(input_schema_json)
-                                             : mcp_xstrdup("{\"type\":\"object\",\"properties\":{}}");
+    if (input_schema_json && mcp_schema_is_safe_object(input_schema_json)) {
+        t->input_schema_json = mcp_xstrdup(input_schema_json);
+    } else {
+        if (input_schema_json && input_schema_json[0])
+            mcp_log(mcp, "mcp %s: dropping unsafe inputSchema for tool %s",
+                    server_name ? server_name : "?", tool_name);
+        t->input_schema_json =
+            mcp_xstrdup("{\"type\":\"object\",\"properties\":{}}");
+    }
     return 0;
 }
 
@@ -1370,6 +1502,7 @@ static int mcp_parse_tools_array(ds4_mcp *mcp, const char *server_name,
     }
     p++;
     bool closed = false;
+    int skipped = 0;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
         if (*p == ']') {
@@ -1392,18 +1525,29 @@ static int mcp_parse_tools_array(ds4_mcp *mcp, const char *server_name,
         const char *schema = mcp_json_obj_get(obj, "inputSchema", &schema_end);
         if (!schema) schema = mcp_json_obj_get(obj, "input_schema", &schema_end);
         char *schema_json = schema ? mcp_json_slice(schema, schema_end) : NULL;
-        int rc = mcp_tool_add(mcp, server_name, name, desc, schema_json, err, err_len);
+        char add_err[192] = {0};
+        int rc = mcp_tool_add(mcp, server_name, name, desc, schema_json,
+                              add_err, sizeof(add_err));
+        if (rc != 0) {
+            /* Skip bad individual tools; do not abort the whole server. */
+            mcp_log(mcp, "mcp %s: skipping tool: %s",
+                    server_name ? server_name : "?",
+                    add_err[0] ? add_err : "invalid tool");
+            skipped++;
+        }
         free(name);
         free(desc);
         free(schema_json);
         free(obj);
-        if (rc != 0) return -1;
         p = obj_end;
     }
     if (!closed) {
         mcp_set_err(err, err_len, "truncated tools array (missing ']')");
         return -1;
     }
+    if (skipped)
+        mcp_log(mcp, "mcp %s: skipped %d invalid tool(s)",
+                server_name ? server_name : "?", skipped);
     return 0;
 }
 
@@ -1432,7 +1576,8 @@ static int mcp_parse_tools_list_result(ds4_mcp *mcp, const char *server_name,
 static int mcp_server_list_all_tools(ds4_mcp *mcp, mcp_server *s,
                                     char *err, size_t err_len) {
     char *cursor = NULL;
-    for (int page = 0; page < 64; page++) {
+    for (int page = 0; page < DS4_MCP_MAX_LIST_PAGES; page++) {
+        mcp_server_drain_stderr(mcp, s);
         mcp_buf params = {0};
         if (cursor && cursor[0]) {
             char *qc = mcp_json_quote(cursor);
@@ -1469,11 +1614,14 @@ static int mcp_server_list_all_tools(ds4_mcp *mcp, mcp_server *s,
         if (!cursor || !cursor[0]) {
             free(cursor);
             cursor = NULL;
-            break;
+            return 0;
         }
     }
     free(cursor);
-    return 0;
+    mcp_set_err(err, err_len,
+                "tools/list exceeded %d pages (still has nextCursor)",
+                DS4_MCP_MAX_LIST_PAGES);
+    return -1;
 }
 
 static int mcp_server_initialize(ds4_mcp *mcp, mcp_server *s,
@@ -1769,7 +1917,7 @@ int ds4_mcp_connect(ds4_mcp *mcp, char *err, size_t err_len) {
             mcp_log(mcp, "failed to initialize %s: %s", s->name, serr);
             mcp_remove_tools_for_server(mcp, s->name);
             mcp_server_shutdown_runtime(s);
-            s->disabled = true;
+            /* Do not flip config disabled: allow a later connect retry. */
             continue;
         }
         connected++;
@@ -1822,8 +1970,8 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         if (ds4_mcp_connect(mcp, err, err_len) != 0) return NULL;
     }
 
-    char server[128];
-    char tool[256];
+    char server[DS4_MCP_MAX_SERVER_NAME + 1];
+    char tool[DS4_MCP_MAX_TOOL_NAME + 1];
     if (!ds4_mcp_split_exposed_name(exposed_name, server, sizeof(server),
                                     tool, sizeof(tool)))
     {
@@ -1844,6 +1992,7 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         mcp_set_err(err, err_len, "MCP server not connected: %s", server);
         return NULL;
     }
+    mcp_server_drain_stderr(mcp, s);
 
     bool known = false;
     for (int i = 0; i < mcp->tool_count; i++) {

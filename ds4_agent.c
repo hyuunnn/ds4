@@ -7174,6 +7174,26 @@ static void test_agent_mcp_helpers(void) {
     AGENT_TEST_ASSERT(strstr(json, "\"raw\":true") != NULL);
     free(json);
 
+    /* Free-text values must be quoted even when is_string is false (DSML default). */
+    {
+        const char *n2[] = { "path" };
+        const char *v2[] = { "/tmp/a.apk" };
+        bool s2[] = { false };
+        char *j2 = ds4_mcp_build_args_json(n2, v2, s2, 1);
+        AGENT_TEST_ASSERT(strstr(j2, "\"path\":\"/tmp/a.apk\"") != NULL);
+        free(j2);
+    }
+    /* Numbers stay raw even when is_string is true (GLM default). */
+    {
+        const char *n2[] = { "count" };
+        const char *v2[] = { "10" };
+        bool s2[] = { true };
+        char *j2 = ds4_mcp_build_args_json(n2, v2, s2, 1);
+        AGENT_TEST_ASSERT(strstr(j2, "\"count\":10") != NULL);
+        AGENT_TEST_ASSERT(strstr(j2, "\"count\":\"10\"") == NULL);
+        free(j2);
+    }
+
     char path[] = "/tmp/ds4_mcp_test_XXXXXX";
     int fd = mkstemp(path);
     AGENT_TEST_ASSERT(fd >= 0);
@@ -9319,9 +9339,15 @@ static void *worker_main(void *arg) {
         agent_publish_system_status(w, "Connecting MCP servers...");
         char mcp_err[256] = {0};
         if (ds4_mcp_connect(w->mcp, mcp_err, sizeof(mcp_err)) != 0) {
-            snprintf(init_err, sizeof(init_err), "MCP connect failed: %s",
-                     mcp_err[0] ? mcp_err : "unknown error");
-            init_ok = false;
+            /* Soft-fail: keep the agent usable with native tools only. */
+            char status[320];
+            snprintf(status, sizeof(status),
+                     "MCP unavailable (%s); continuing with built-in tools",
+                     mcp_err[0] ? mcp_err : "connect failed");
+            agent_publish_system_status(w, status);
+            agent_trace(w, "%s", status);
+            if (w->cfg->non_interactive)
+                fprintf(stderr, "ds4-agent: %s\n", status);
         } else {
             char status[128];
             snprintf(status, sizeof(status),
@@ -10700,13 +10726,13 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     set_nonblock(w->wake_fd[1], true, &old_flags);
     if (ds4_session_create(&w->session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4-agent: session backend is required\n");
-        return -1;
+        goto fail;
     }
     w->cache_dir = agent_default_cache_dir();
     if (!agent_mkdir_p(w->cache_dir)) {
         fprintf(stderr, "ds4-agent: failed to create %s: %s\n",
                 w->cache_dir, strerror(errno));
-        return -1;
+        goto fail;
     }
     ds4_web_config web_cfg = {
         .home_dir = getenv("HOME"),
@@ -10736,7 +10762,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         if (!w->mcp) {
             fprintf(stderr, "ds4-agent: MCP config error: %s\n",
                     mcp_err[0] ? mcp_err : "unknown error");
-            return -1;
+            goto fail;
         }
     }
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
@@ -10745,11 +10771,33 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         if (!w->trace) {
             fprintf(stderr, "ds4-agent: failed to open trace %s: %s\n",
                     cfg->gen.trace_path, strerror(errno));
-            return -1;
+            goto fail;
         }
     }
-    if (pthread_create(&w->thread, NULL, worker_main, w) != 0) return -1;
+    if (pthread_create(&w->thread, NULL, worker_main, w) != 0) goto fail;
     return 0;
+
+fail:
+    ds4_mcp_free(w->mcp);
+    w->mcp = NULL;
+    ds4_web_free(w->web);
+    w->web = NULL;
+    ds4_session_free(w->session);
+    w->session = NULL;
+    free(w->cache_dir);
+    w->cache_dir = NULL;
+    free(w->sysprompt_path);
+    w->sysprompt_path = NULL;
+    if (w->trace) {
+        fclose(w->trace);
+        w->trace = NULL;
+    }
+    if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
+    if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
+    w->wake_fd[0] = w->wake_fd[1] = -1;
+    pthread_cond_destroy(&w->cond);
+    pthread_mutex_destroy(&w->mu);
+    return -1;
 }
 
 /* Shut down the worker and release owned resources, including any live bash
@@ -11214,7 +11262,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             editor_stop(&editor);
             editor_restore_terminal_layout(&editor);
             agent_yes_no_options approval_opts = {
-                .timeout_sec = 30,
+                /* MCP connect at startup may need longer than Chrome start. */
+                .timeout_sec = 120,
                 .timeout_answer = AGENT_YES_NO_AUTO_NO,
             };
             bool approval_timed_out = false;
@@ -11502,6 +11551,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
+    /* MCP and other pipe peers must not kill the whole agent on EPIPE. */
+    signal(SIGPIPE, SIG_IGN);
     agent_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
