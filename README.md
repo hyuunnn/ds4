@@ -816,6 +816,30 @@ future saves and is derived from the first user prompt and creation time.
 conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
 
+### Persistent goals (`/goal`)
+
+For long autonomous work that should keep going across turns, set a session goal:
+
+```text
+/goal Refactor the auth module, add tests, and make sure the build stays green
+```
+
+While the goal is `active`, each finished model turn is followed by a synthetic
+continuation prompt so the agent keeps working without waiting for new user
+input. Status and tools:
+
+| Control | Effect |
+|---------|--------|
+| `/goal` | Show objective, status, time/token usage, continuation count |
+| `/goal pause` / `/goal resume` | Stop or restart the auto-continue loop |
+| `/goal clear` | Drop the current goal |
+| `create_goal` / `update_goal` / `get_goal` | Native tools for the model (`complete` or `blocked` only) |
+
+Safety rails: at most 50 automatic continuations; `update_goal blocked` requires
+the same blocking condition three times in a row; Ctrl+C marks the goal blocked
+and stops auto-continue until `/goal resume`. Goal state is stored next to the
+session as `~/.ds4/kvcache/<sha>.goal.json` and is loaded by `/switch`.
+
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
