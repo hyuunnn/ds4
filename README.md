@@ -837,15 +837,11 @@ Example `~/.ds4/mcp.json`:
 {
   "mcpServers": {
     "demo": {
-      "command": "my-mcp-server",
-      "args": ["--stdio"],
-      "env": {
-        "FOO": "bar"
-      }
-    },
-    "other": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-everything"]
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {
+        "SOME_VAR": "value"
+      }
     }
   }
 }
