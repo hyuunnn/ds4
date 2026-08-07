@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_mcp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
 
@@ -71,6 +72,7 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
     const char *chdir_path;
+    const char *mcp_config_path;
     bool non_interactive;
     bool edit_upto;
 } agent_config;
@@ -138,6 +140,7 @@ typedef struct {
     size_t out_len;
     size_t out_cap;
     ds4_web *web;
+    ds4_mcp *mcp;
     bool web_approval_pending;
     bool web_approval_answered;
     bool web_approval_result;
@@ -340,6 +343,11 @@ static void agent_publish_system_status(agent_worker *w, const char *msg);
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len);
 static void agent_web_log(void *privdata, const char *message);
+static bool agent_web_cancel(void *privdata);
+static int agent_mcp_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len);
+static void agent_mcp_log(void *privdata, const char *message);
+static bool agent_mcp_cancel(void *privdata);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -613,6 +621,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "--edit-upto")) {
             c.edit_upto = true;
+        } else if (!strcmp(arg, "--mcp-config")) {
+            c.mcp_config_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -1036,16 +1046,34 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_dsml_tools_prompt(bool edit_upto) {
+static char *agent_build_dsml_tools_prompt(bool edit_upto, ds4_mcp *mcp) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
                                  : agent_tools_prompt_edit_exact;
+    char *mcp_schemas = mcp ? ds4_mcp_build_dsml_schemas(mcp) : NULL;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = xmalloc(a + b + c + 1);
+    size_t d = mcp_schemas ? strlen(mcp_schemas) : 0;
+    char *out = xmalloc(a + b + c + d + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    /* Insert MCP schemas before the trailing Rules section when present. */
+    if (d) {
+        const char *rules = strstr(agent_tools_prompt_after_edit, "# Rules\n");
+        if (rules) {
+            size_t before = (size_t)(rules - agent_tools_prompt_after_edit);
+            memcpy(out + a + b, agent_tools_prompt_after_edit, before);
+            memcpy(out + a + b + before, mcp_schemas, d);
+            memcpy(out + a + b + before + d, rules,
+                   strlen(agent_tools_prompt_after_edit) - before + 1);
+        } else {
+            memcpy(out + a + b, agent_tools_prompt_after_edit, c);
+            memcpy(out + a + b + c, mcp_schemas, d + 1);
+        }
+    } else {
+        memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    }
+    free(mcp_schemas);
     return out;
 }
 
@@ -1094,9 +1122,11 @@ static const char agent_glm_tool_schemas[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}\n";
 
-static char *agent_build_glm_tools_prompt(bool edit_upto) {
+static char *agent_build_glm_tools_prompt(bool edit_upto, ds4_mcp *mcp) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
     const char *schemas = agent_glm_tool_schemas;
+    char *mcp_schemas = mcp ? ds4_mcp_build_glm_schemas(mcp) : NULL;
+    size_t mcp_len = mcp_schemas ? strlen(mcp_schemas) : 0;
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t a = strlen(agent_glm_tools_prompt_intro);
@@ -1104,19 +1134,21 @@ static char *agent_build_glm_tools_prompt(bool edit_upto) {
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     size_t d = strlen(edit);
     size_t e = strlen(agent_glm_tools_prompt_rules_tail);
-    char *out = xmalloc(a + b + c + d + e + 1);
+    char *out = xmalloc(a + b + mcp_len + c + d + e + 1);
     memcpy(out, agent_glm_tools_prompt_intro, a);
     memcpy(out + a, schemas, b);
-    memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
-    memcpy(out + a + b + c, edit, d);
-    memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
+    if (mcp_len) memcpy(out + a + b, mcp_schemas, mcp_len);
+    memcpy(out + a + b + mcp_len, agent_glm_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + mcp_len + c, edit, d);
+    memcpy(out + a + b + mcp_len + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
+    free(mcp_schemas);
     return out;
 }
 
-static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
+static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto, ds4_mcp *mcp) {
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
-        return agent_build_glm_tools_prompt(edit_upto);
-    return agent_build_dsml_tools_prompt(edit_upto);
+        return agent_build_glm_tools_prompt(edit_upto, mcp);
+    return agent_build_dsml_tools_prompt(edit_upto, mcp);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -1135,8 +1167,8 @@ static const char agent_glm_syntax_reminder[] =
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
 static char *agent_build_system_prompt_reminder(ds4_engine *engine,
-                                                bool edit_upto) {
-    char *tools = agent_build_tools_prompt(engine, edit_upto);
+                                                bool edit_upto, ds4_mcp *mcp) {
+    char *tools = agent_build_tools_prompt(engine, edit_upto, mcp);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     const size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1147,13 +1179,14 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine,
 }
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
-                                       const char *extra, bool edit_upto) {
+                                       const char *extra, bool edit_upto,
+                                       ds4_mcp *mcp) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt(engine, edit_upto);
+    char *tools_prompt = agent_build_tools_prompt(engine, edit_upto, mcp);
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
@@ -1204,7 +1237,8 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     }
 
     char *reminder = agent_build_system_prompt_reminder(w->engine,
-                                                        w->cfg->edit_upto);
+                                                        w->cfg->edit_upto,
+                                                        w->mcp);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -4441,7 +4475,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
         ds4_chat_append_max_effort_prefix(w->engine, out);
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system,
-                               w->cfg->edit_upto);
+                               w->cfg->edit_upto, w->mcp);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -4523,6 +4557,55 @@ static bool agent_web_cancel(void *privdata) {
     return worker_should_interrupt(privdata);
 }
 
+/* MCP connection approval reuses the same UI approval channel as Chrome. */
+static int agent_mcp_confirm(void *privdata, const char *message,
+                             char *err, size_t err_len) {
+    agent_worker *w = privdata;
+    if (!w || w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "MCP server startup requires interactive approval "
+                 "(or use a TTY without --non-interactive)");
+        return 0;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    w->web_approval_pending = true;
+    w->web_approval_answered = false;
+    w->web_approval_result = false;
+    w->web_approval_error[0] = '\0';
+    snprintf(w->web_approval_message, sizeof(w->web_approval_message),
+             "%s", message ? message : "Start MCP servers? (y/n) ");
+    agent_wake_locked(w);
+    while (!w->stop && !w->interrupt && !w->web_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->web_approval_result;
+    if (!w->web_approval_answered && (w->stop || w->interrupt)) {
+        ok = false;
+        w->web_approval_pending = false;
+        snprintf(w->web_approval_error, sizeof(w->web_approval_error),
+                 "interrupted");
+    }
+    if (!ok) {
+        snprintf(err, err_len, "%s",
+                 w->web_approval_error[0] ? w->web_approval_error :
+                 "user denied MCP server start");
+    }
+    pthread_mutex_unlock(&w->mu);
+    return ok ? 1 : 0;
+}
+
+static void agent_mcp_log(void *privdata, const char *message) {
+    agent_worker *w = privdata;
+    if (!w || !message || !message[0]) return;
+    agent_trace(w, "mcp: %s", message);
+    if (!w->cfg->non_interactive)
+        agent_publish_system_status(w, message);
+}
+
+static bool agent_mcp_cancel(void *privdata) {
+    return worker_should_interrupt(privdata);
+}
+
 static bool worker_take_web_approval_request(agent_worker *w,
                                              char *message, size_t message_len) {
     pthread_mutex_lock(&w->mu);
@@ -4543,7 +4626,7 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
     if (!allow)
         snprintf(w->web_approval_error, sizeof(w->web_approval_error),
                  "%s", deny_error && deny_error[0] ? deny_error :
-                 "user denied Chrome browser start");
+                 "user denied approval request");
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -6971,10 +7054,10 @@ static void test_agent_glm_tool_parser_rejects_missing_value(void) {
 }
 
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
-    char *dsml_default = agent_build_dsml_tools_prompt(false);
-    char *dsml_upto = agent_build_dsml_tools_prompt(true);
-    char *glm_default = agent_build_glm_tools_prompt(false);
-    char *glm_upto = agent_build_glm_tools_prompt(true);
+    char *dsml_default = agent_build_dsml_tools_prompt(false, NULL);
+    char *dsml_upto = agent_build_dsml_tools_prompt(true, NULL);
+    char *glm_default = agent_build_glm_tools_prompt(false, NULL);
+    char *glm_upto = agent_build_glm_tools_prompt(true, NULL);
 
     AGENT_TEST_ASSERT(strstr(dsml_default, "[upto]") == NULL);
     AGENT_TEST_ASSERT(strstr(dsml_upto, "[upto]") != NULL);
@@ -6988,7 +7071,7 @@ static void test_agent_edit_upto_prompt_is_opt_in(void) {
 }
 
 static void test_agent_glm_tools_prompt_is_native(void) {
-    char *prompt = agent_build_glm_tools_prompt(false);
+    char *prompt = agent_build_glm_tools_prompt(false, NULL);
 
     AGENT_TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<tool_call>") != NULL);
@@ -7066,6 +7149,69 @@ static void test_agent_cache_rejects_impossible_lengths(void) {
     fclose(fp);
 }
 
+static void test_agent_mcp_helpers(void) {
+    char *exposed = ds4_mcp_exposed_name("demo", "echo");
+    AGENT_TEST_ASSERT(exposed && !strcmp(exposed, "demo__echo"));
+    char server[64], tool[64];
+    AGENT_TEST_ASSERT(ds4_mcp_split_exposed_name(exposed, server, sizeof(server),
+                                                  tool, sizeof(tool)));
+    AGENT_TEST_ASSERT(!strcmp(server, "demo"));
+    AGENT_TEST_ASSERT(!strcmp(tool, "echo"));
+    AGENT_TEST_ASSERT(!ds4_mcp_split_exposed_name("nope", server, sizeof(server),
+                                                   tool, sizeof(tool)));
+    free(exposed);
+
+    const char *names[] = { "path", "max_lines", "raw" };
+    const char *values[] = { "/tmp/a.apk", "100", "true" };
+    bool is_string[] = { true, false, false };
+    char *json = ds4_mcp_build_args_json(names, values, is_string, 3);
+    AGENT_TEST_ASSERT(strstr(json, "\"path\":\"/tmp/a.apk\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"max_lines\":100") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"raw\":true") != NULL);
+    free(json);
+
+    char path[] = "/tmp/ds4_mcp_test_XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char *body =
+        "{\n"
+        "  \"mcpServers\": {\n"
+        "    \"demo\": {\n"
+        "      \"command\": \"my-mcp-server\",\n"
+        "      \"args\": [\"--stdio\"],\n"
+        "      \"env\": {\"FOO\": \"bar\"}\n"
+        "    },\n"
+        "    \"other\": {\n"
+        "      \"command\": \"npx\",\n"
+        "      \"args\": [\"-y\", \"some-mcp-package\"],\n"
+        "      \"disabled\": true\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    AGENT_TEST_ASSERT(write(fd, body, strlen(body)) == (ssize_t)strlen(body));
+    close(fd);
+
+    char err[160] = {0};
+    ds4_mcp_config c = {
+        .config_path = path,
+        .auto_approve = true,
+    };
+    ds4_mcp *mcp = ds4_mcp_create(&c, err, sizeof(err));
+    AGENT_TEST_ASSERT(mcp != NULL);
+    if (!mcp) {
+        unlink(path);
+        return;
+    }
+    AGENT_TEST_ASSERT(ds4_mcp_server_count(mcp) == 2);
+    AGENT_TEST_ASSERT(ds4_mcp_tool_count(mcp) == 0);
+    char *dsml = ds4_mcp_build_dsml_schemas(mcp);
+    AGENT_TEST_ASSERT(dsml && dsml[0] == '\0');
+    free(dsml);
+    ds4_mcp_free(mcp);
+    unlink(path);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7083,6 +7229,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
     test_agent_glm_tool_parser_rejects_missing_value();
+    test_agent_mcp_helpers();
 }
 #endif
 
@@ -8040,6 +8187,45 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
+
+    if (w->mcp && ds4_mcp_has_tool(w->mcp, call->name)) {
+        const char **names = NULL;
+        const char **values = NULL;
+        bool *is_string = NULL;
+        int n = call->argc;
+        if (n > 0) {
+            names = xmalloc((size_t)n * sizeof(char *));
+            values = xmalloc((size_t)n * sizeof(char *));
+            is_string = xmalloc((size_t)n * sizeof(bool));
+            for (int i = 0; i < n; i++) {
+                names[i] = call->args[i].name;
+                values[i] = call->args[i].value;
+                is_string[i] = call->args[i].is_string;
+            }
+        }
+        char *args_json = ds4_mcp_build_args_json(names, values, is_string, n);
+        free((void *)names);
+        free((void *)values);
+        free(is_string);
+
+        char err[256] = {0};
+        char *text = ds4_mcp_call_tool(w->mcp, call->name, args_json, err, sizeof(err));
+        free(args_json);
+        if (!text) {
+            agent_buf result = {0};
+            agent_buf_puts(&result, "Tool error: MCP ");
+            agent_buf_puts(&result, call->name);
+            agent_buf_puts(&result, ": ");
+            agent_buf_puts(&result, err[0] ? err : "call failed");
+            agent_buf_puts(&result, "\n");
+            return agent_buf_take(&result);
+        }
+        agent_buf result = {0};
+        agent_buf_puts(&result, text);
+        if (text[0] && text[strlen(text) - 1] != '\n') agent_buf_puts(&result, "\n");
+        free(text);
+        return agent_buf_take(&result);
+    }
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
@@ -9093,6 +9279,22 @@ static void *worker_main(void *arg) {
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
     bool init_ok = agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
+    if (init_ok && w->mcp) {
+        agent_publish_system_status(w, "Connecting MCP servers...");
+        char mcp_err[256] = {0};
+        if (ds4_mcp_connect(w->mcp, mcp_err, sizeof(mcp_err)) != 0) {
+            snprintf(init_err, sizeof(init_err), "MCP connect failed: %s",
+                     mcp_err[0] ? mcp_err : "unknown error");
+            init_ok = false;
+        } else {
+            char status[128];
+            snprintf(status, sizeof(status),
+                     "MCP ready: %d tool(s) from %d server(s)",
+                     ds4_mcp_tool_count(w->mcp), ds4_mcp_server_count(w->mcp));
+            agent_publish_system_status(w, status);
+            agent_trace(w, "%s", status);
+        }
+    }
     if (init_ok && !w->cfg->gen.raw_prompt)
         init_ok = agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err));
     if (!init_ok) {
@@ -10480,6 +10682,26 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
+    if (cfg->mcp_config_path && cfg->mcp_config_path[0]) {
+        char mcp_err[256] = {0};
+        ds4_mcp_config mcp_cfg = {
+            .config_path = cfg->mcp_config_path,
+            .confirm = agent_mcp_confirm,
+            .confirm_privdata = w,
+            .log = agent_mcp_log,
+            .log_privdata = w,
+            .cancel = agent_mcp_cancel,
+            .cancel_privdata = w,
+            /* Scripts cannot answer the connect prompt; auto-approve there. */
+            .auto_approve = cfg->non_interactive,
+        };
+        w->mcp = ds4_mcp_create(&mcp_cfg, mcp_err, sizeof(mcp_err));
+        if (!w->mcp) {
+            fprintf(stderr, "ds4-agent: MCP config error: %s\n",
+                    mcp_err[0] ? mcp_err : "unknown error");
+            return -1;
+        }
+    }
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -10499,6 +10721,8 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    ds4_mcp_free(w->mcp);
+    w->mcp = NULL;
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
@@ -10961,7 +11185,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                 &approval_opts,
                                                 &approval_timed_out);
             worker_answer_web_approval(&worker, allow,
-                approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+                approval_timed_out ? "approval request timed out" : NULL);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;

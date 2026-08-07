@@ -305,9 +305,11 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
+    opt(fp, c, "--mcp-config FILE", "JSON MCP server config (stdio tools/list + tools/call).");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    para(fp, c, "MCP tools are exposed as server__tool names. Interactive mode prompts once before spawning servers; --non-interactive auto-approves.");
     fputc('\n', fp);
 }
 

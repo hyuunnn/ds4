@@ -819,6 +819,47 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
+### MCP tools
+
+`ds4-agent` can attach external [MCP](https://modelcontextprotocol.io) servers
+over stdio and expose their tools as native agent tools. First version supports
+`tools/list` and `tools/call` only.
+
+Pass a Claude/Cursor-style JSON config:
+
+```bash
+./ds4-agent --mcp-config ~/.ds4/mcp.json
+```
+
+Example `~/.ds4/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "demo": {
+      "command": "my-mcp-server",
+      "args": ["--stdio"],
+      "env": {
+        "FOO": "bar"
+      }
+    },
+    "other": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    }
+  }
+}
+```
+
+Notes:
+
+* Tools appear to the model as `server__tool` (for example `demo__echo`).
+* Interactive mode asks once before spawning the configured servers; tool calls
+  then run without per-call prompts. `--non-interactive` auto-approves connect.
+* Connect/list runs at agent startup so tool schemas are part of the system
+  prompt and the `sysprompt.kv` checkpoint.
+* Resources and prompts are intentionally out of scope for this first cut.
+
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
