@@ -30,6 +30,8 @@
 #define DS4_MCP_MAX_SERVER_NAME 64
 #define DS4_MCP_MAX_TOOL_NAME 128
 #define DS4_MCP_IO_TIMEOUT_MS 30000
+/* tools/call may run long (analysis, installs); do not use the short handshake timeout. */
+#define DS4_MCP_TOOL_CALL_TIMEOUT_MS (5 * 60 * 1000)
 #define DS4_MCP_MAX_MSG (16 * 1024 * 1024)
 #define DS4_MCP_MAX_LIST_PAGES 64
 
@@ -1058,7 +1060,8 @@ char *ds4_mcp_build_args_json(const char *const *names,
 typedef enum {
     MCP_RPC_OK = 0,
     MCP_RPC_APP_ERROR = 1,   /* JSON-RPC error object; process still healthy */
-    MCP_RPC_TRANSPORT = -1,  /* pipe/timeout/interrupt; process may be dead */
+    MCP_RPC_TIMEOUT = 2,     /* wait deadline; process likely still healthy */
+    MCP_RPC_TRANSPORT = -1,  /* pipe/interrupt/desync; process may be dead */
 } mcp_rpc_status;
 
 static void mcp_ignore_sigpipe_once(void) {
@@ -1285,25 +1288,35 @@ static char *mcp_server_take_message(mcp_server *s) {
 
 static void mcp_server_drain_stderr(ds4_mcp *mcp, mcp_server *s);
 
+/* Returns response body on success. On failure returns NULL and sets
+ * *out_status when non-NULL: TIMEOUT vs TRANSPORT vs cancel-as-TRANSPORT. */
 static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
-                                      int timeout_ms, char *err, size_t err_len) {
+                                      int timeout_ms,
+                                      mcp_rpc_status *out_status,
+                                      char *err, size_t err_len) {
+    if (out_status) *out_status = MCP_RPC_TRANSPORT;
     double deadline = (double)time(NULL) + (timeout_ms / 1000.0) + 1.0;
     for (;;) {
         if (mcp_cancel(mcp)) {
             mcp_set_err(err, err_len, "interrupted");
+            if (out_status) *out_status = MCP_RPC_TRANSPORT;
             return NULL;
         }
         mcp_server_drain_stderr(mcp, s);
         char *msg = mcp_server_take_message(s);
         if (msg) {
             /* Notifications / unmatched messages are discarded for v1. */
-            if (mcp_json_id_matches(msg, id)) return msg;
+            if (mcp_json_id_matches(msg, id)) {
+                if (out_status) *out_status = MCP_RPC_OK;
+                return msg;
+            }
             free(msg);
             continue;
         }
         double now = (double)time(NULL);
         if (now >= deadline) {
             mcp_set_err(err, err_len, "MCP request timed out");
+            if (out_status) *out_status = MCP_RPC_TIMEOUT;
             return NULL;
         }
         int wait_ms = (int)((deadline - now) * 1000.0);
@@ -1343,15 +1356,15 @@ static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
 
 /*
  * Perform a JSON-RPC request.
- * - MCP_RPC_OK: *resp_out is the full response body (caller frees).
- * - MCP_RPC_APP_ERROR: server returned error; *resp_out may be NULL; err set;
- *   connection remains usable.
- * - MCP_RPC_TRANSPORT: I/O/timeout/cancel; *resp_out NULL; connection suspect.
+ * timeout_ms: handshake/list use DS4_MCP_IO_TIMEOUT_MS; tools/call uses the
+ * longer DS4_MCP_TOOL_CALL_TIMEOUT_MS so slow tools are not false transport kills.
  */
-static mcp_rpc_status mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
-                              const char *params_json,
-                              char **resp_out,
-                              char *err, size_t err_len) {
+static mcp_rpc_status mcp_rpc_timeout(ds4_mcp *mcp, mcp_server *s,
+                                      const char *method,
+                                      const char *params_json,
+                                      int timeout_ms,
+                                      char **resp_out,
+                                      char *err, size_t err_len) {
     if (resp_out) *resp_out = NULL;
     int id = s->next_id++;
     mcp_buf req = {0};
@@ -1373,9 +1386,12 @@ static mcp_rpc_status mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
         return MCP_RPC_TRANSPORT;
     }
     free(wire);
-    char *resp = mcp_server_recv_matching(mcp, s, id, DS4_MCP_IO_TIMEOUT_MS,
+    mcp_rpc_status wait_st = MCP_RPC_TRANSPORT;
+    char *resp = mcp_server_recv_matching(mcp, s, id, timeout_ms, &wait_st,
                                           err, err_len);
-    if (!resp) return MCP_RPC_TRANSPORT;
+    if (!resp) {
+        return wait_st == MCP_RPC_TIMEOUT ? MCP_RPC_TIMEOUT : MCP_RPC_TRANSPORT;
+    }
     if (mcp_json_has_error(resp)) {
         char *em = mcp_json_error_message(resp);
         mcp_set_err(err, err_len, "MCP %s error: %s", method,
@@ -1387,6 +1403,14 @@ static mcp_rpc_status mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
     if (resp_out) *resp_out = resp;
     else free(resp);
     return MCP_RPC_OK;
+}
+
+static mcp_rpc_status mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
+                              const char *params_json,
+                              char **resp_out,
+                              char *err, size_t err_len) {
+    return mcp_rpc_timeout(mcp, s, method, params_json, DS4_MCP_IO_TIMEOUT_MS,
+                           resp_out, err, err_len);
 }
 
 static int mcp_notify(ds4_mcp *mcp, mcp_server *s, const char *method,
@@ -2192,7 +2216,8 @@ static void mcp_server_refresh_liveness(mcp_server *s) {
     }
 }
 
-/* Spawn + initialize one server only (used for on-demand reconnect). */
+/* Spawn + initialize one server only (used for on-demand reconnect).
+ * Preserves the existing tool catalog if re-init fails so dispatch can retry. */
 static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
                                        char *err, size_t err_len) {
     if (!s || s->disabled) {
@@ -2203,7 +2228,6 @@ static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
         mcp_set_err(err, err_len, "MCP server start was denied");
         return -1;
     }
-    /* Never spawn without an explicit prior approval (or auto_approve). */
     if (!mcp->spawn_approved && !mcp->auto_approve) {
         mcp_set_err(err, err_len, "MCP servers have not been approved");
         return -1;
@@ -2219,13 +2243,58 @@ static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
         mcp_set_err(err, err_len, "%s", serr);
         return -1;
     }
+
+    /* Snapshot existing tools so a failed re-list can restore them. */
+    int snap_n = 0;
+    mcp_tool *snap = NULL;
+    for (int i = 0; i < mcp->tool_count; i++) {
+        if (mcp->tools[i].server_name && s->name &&
+            !strcmp(mcp->tools[i].server_name, s->name))
+            snap_n++;
+    }
+    if (snap_n > 0) {
+        snap = mcp_xmalloc((size_t)snap_n * sizeof(mcp_tool));
+        int k = 0;
+        for (int i = 0; i < mcp->tool_count; i++) {
+            if (mcp->tools[i].server_name && s->name &&
+                !strcmp(mcp->tools[i].server_name, s->name))
+            {
+                snap[k].server_name = mcp_xstrdup(mcp->tools[i].server_name);
+                snap[k].tool_name = mcp_xstrdup(mcp->tools[i].tool_name);
+                snap[k].exposed_name = mcp_xstrdup(mcp->tools[i].exposed_name);
+                snap[k].description = mcp_xstrdup(mcp->tools[i].description ?
+                                                  mcp->tools[i].description : "");
+                snap[k].input_schema_json =
+                    mcp_xstrdup(mcp->tools[i].input_schema_json ?
+                                mcp->tools[i].input_schema_json :
+                                "{\"type\":\"object\",\"properties\":{}}");
+                k++;
+            }
+        }
+        snap_n = k;
+    }
+
     mcp_remove_tools_for_server(mcp, s->name);
     if (mcp_server_initialize(mcp, s, serr, sizeof(serr)) != 0) {
+        /* Restore previous catalog; leave process down for a later retry. */
         mcp_remove_tools_for_server(mcp, s->name);
+        for (int i = 0; i < snap_n; i++) {
+            if (mcp->tool_count >= DS4_MCP_MAX_TOOLS) break;
+            if (!mcp->tools) {
+                mcp->tools = mcp_xmalloc(DS4_MCP_MAX_TOOLS * sizeof(mcp_tool));
+                memset(mcp->tools, 0, DS4_MCP_MAX_TOOLS * sizeof(mcp_tool));
+            }
+            mcp->tools[mcp->tool_count++] = snap[i];
+            memset(&snap[i], 0, sizeof(snap[i]));
+        }
+        for (int i = 0; i < snap_n; i++) mcp_tool_clear(&snap[i]);
+        free(snap);
         mcp_server_shutdown_runtime(s);
         mcp_set_err(err, err_len, "%s", serr);
         return -1;
     }
+    for (int i = 0; i < snap_n; i++) mcp_tool_clear(&snap[i]);
+    free(snap);
     mcp->connected = true;
     return 0;
 }
@@ -2289,15 +2358,26 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
 
     char *resp = NULL;
     pthread_mutex_lock(&mcp->mu);
-    mcp_rpc_status st = mcp_rpc(mcp, s, "tools/call", params_s, &resp, err, err_len);
+    mcp_rpc_status st = mcp_rpc_timeout(mcp, s, "tools/call", params_s,
+                                        DS4_MCP_TOOL_CALL_TIMEOUT_MS,
+                                        &resp, err, err_len);
     pthread_mutex_unlock(&mcp->mu);
     free(params_s);
 
+    if (st == MCP_RPC_TIMEOUT) {
+        /* Slow tool: leave process up and catalog intact so the model can retry
+         * or call something else. The in-flight call may still complete server-
+         * side; late replies are discarded by id filter. */
+        if (!err[0])
+            mcp_set_err(err, err_len,
+                        "MCP tool call timed out after %d s: %s",
+                        DS4_MCP_TOOL_CALL_TIMEOUT_MS / 1000, exposed_name);
+        free(resp);
+        return NULL;
+    }
     if (st == MCP_RPC_TRANSPORT) {
-        /* Keep tool catalog. Only drop the live process so a later approved
-         * call can respawn. Do not treat cancel the same as death if no bytes
-         * of a new frame were committed — still shut down to avoid partial
-         * frame desync on reuse. */
+        /* Broken pipe / interrupt / desync: drop runtime only, keep catalog so
+         * has_tool remains true and ensure_connected can retry. */
         mcp_server_shutdown_runtime(s);
         if (ds4_mcp_connected_server_count(mcp) == 0)
             mcp->connected = false;
@@ -2306,7 +2386,6 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         return NULL;
     }
     if (st == MCP_RPC_APP_ERROR) {
-        /* Protocol/application error: process stays up, tools stay registered. */
         return NULL;
     }
 

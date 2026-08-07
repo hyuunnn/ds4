@@ -8237,6 +8237,32 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  * ============================================================================
  */
 
+/* Demote only pure JSON scalars (not objects/arrays) for GLM's always-string
+ * args. Objects stay quoted so string schema fields that happen to look like
+ * JSON text are preserved; numbers/bools/null become typed JSON. */
+static bool agent_mcp_value_is_json_scalar(const char *s) {
+    if (!s || !s[0]) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!strcmp(s, "true") || !strcmp(s, "false") || !strcmp(s, "null"))
+        return true;
+    const char *n = s;
+    if (*n == '-') n++;
+    if (*n < '0' || *n > '9') return false;
+    while (*n >= '0' && *n <= '9') n++;
+    if (*n == '.') {
+        n++;
+        if (*n < '0' || *n > '9') return false;
+        while (*n >= '0' && *n <= '9') n++;
+    }
+    if (*n == 'e' || *n == 'E') {
+        n++;
+        if (*n == '+' || *n == '-') n++;
+        if (*n < '0' || *n > '9') return false;
+        while (*n >= '0' && *n <= '9') n++;
+    }
+    return *n == '\0';
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -8253,6 +8279,11 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
+    /* Live catalog OR previously known configured server__tool (reconnect path).
+     * is_configured_tool alone would spawn on hallucinated names; require the
+     * name to look like server__tool and either be cataloged or match a server
+     * that already contributed tools at least once (has_tool history is the
+     * catalog — after failed re-list we restore snapshot so has_tool stays). */
     if (w->mcp && ds4_mcp_has_tool(w->mcp, call->name)) {
         const char **names = NULL;
         const char **values = NULL;
@@ -8265,10 +8296,13 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             for (int i = 0; i < n; i++) {
                 names[i] = call->args[i].name;
                 values[i] = call->args[i].value;
-                /* Honor parser flags. DSML string="false" with JSON text stays
-                 * raw via is_string=false; GLM string args stay quoted so
-                 * string-schema fields (ids/zips) are not retyped. */
-                is_string[i] = call->args[i].is_string;
+                bool as_str = call->args[i].is_string;
+                const char *v = call->args[i].value ? call->args[i].value : "";
+                /* GLM marks every arg string=true. Demote pure scalars only so
+                 * number/boolean schemas work; leave object-like text quoted. */
+                if (as_str && agent_mcp_value_is_json_scalar(v))
+                    as_str = false;
+                is_string[i] = as_str;
             }
         }
         char *args_json = ds4_mcp_build_args_json(names, values, is_string, n);
@@ -8280,19 +8314,19 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         char *text = ds4_mcp_call_tool(w->mcp, call->name, args_json, err, sizeof(err));
         free(args_json);
         if (!text) {
-            agent_buf result = {0};
-            agent_buf_puts(&result, "Tool error: MCP ");
-            agent_buf_puts(&result, call->name);
-            agent_buf_puts(&result, ": ");
-            agent_buf_puts(&result, err[0] ? err : "call failed");
-            agent_buf_puts(&result, "\n");
-            return agent_buf_take(&result);
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: MCP ");
+            agent_buf_puts(&b, call->name);
+            agent_buf_puts(&b, ": ");
+            agent_buf_puts(&b, err[0] ? err : "call failed");
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
         }
-        agent_buf result = {0};
-        agent_buf_puts(&result, text);
-        if (text[0] && text[strlen(text) - 1] != '\n') agent_buf_puts(&result, "\n");
+        agent_buf b = {0};
+        agent_buf_puts(&b, text);
+        if (text[0] && text[strlen(text) - 1] != '\n') agent_buf_puts(&b, "\n");
         free(text);
-        return agent_buf_take(&result);
+        return agent_buf_take(&b);
     }
 
     if (!strcmp(call->name, "bash")) {
