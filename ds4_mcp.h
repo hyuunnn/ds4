@@ -50,6 +50,9 @@ char *ds4_mcp_build_glm_schemas(const ds4_mcp *mcp);
 /* Look up a model-visible name of the form "server__tool". */
 bool ds4_mcp_has_tool(const ds4_mcp *mcp, const char *exposed_name);
 
+/* True if exposed_name targets a configured (possibly currently down) server. */
+bool ds4_mcp_is_configured_tool(const ds4_mcp *mcp, const char *exposed_name);
+
 /*
  * Call an exposed tool.  args_json is a JSON object string for arguments
  * (e.g. {"path":"/tmp/a.apk"}).  On success returns malloc'd text content

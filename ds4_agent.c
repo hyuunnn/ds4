@@ -8237,6 +8237,54 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
  * ============================================================================
  */
 
+/* True if s is a complete non-string JSON value (number/bool/null/object/array).
+ * Used only at MCP dispatch to demote GLM's always-string args. */
+static bool agent_mcp_value_looks_json(const char *s) {
+    if (!s || !s[0] || s[0] == '"') return false;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '{' || *p == '[') {
+        /* lightweight balance check */
+        int depth = 0;
+        bool in_str = false, esc = false;
+        for (const char *q = p; *q; q++) {
+            char c = *q;
+            if (in_str) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') in_str = true;
+            else if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') {
+                depth--;
+                if (depth < 0) return false;
+            }
+        }
+        return depth == 0;
+    }
+    if (!strcmp(p, "true") || !strcmp(p, "false") || !strcmp(p, "null"))
+        return true;
+    /* number */
+    const char *n = p;
+    if (*n == '-') n++;
+    if (*n < '0' || *n > '9') return false;
+    while (*n >= '0' && *n <= '9') n++;
+    if (*n == '.') {
+        n++;
+        if (*n < '0' || *n > '9') return false;
+        while (*n >= '0' && *n <= '9') n++;
+    }
+    if (*n == 'e' || *n == 'E') {
+        n++;
+        if (*n == '+' || *n == '-') n++;
+        if (*n < '0' || *n > '9') return false;
+        while (*n >= '0' && *n <= '9') n++;
+    }
+    return *n == '\0';
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -8253,7 +8301,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
-    if (w->mcp && ds4_mcp_has_tool(w->mcp, call->name)) {
+    if (w->mcp && (ds4_mcp_has_tool(w->mcp, call->name) ||
+                   ds4_mcp_is_configured_tool(w->mcp, call->name))) {
         const char **names = NULL;
         const char **values = NULL;
         bool *is_string = NULL;
@@ -8265,7 +8314,14 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             for (int i = 0; i < n; i++) {
                 names[i] = call->args[i].name;
                 values[i] = call->args[i].value;
-                is_string[i] = call->args[i].is_string;
+                /* GLM always marks args as strings. Demote pure JSON literals
+                 * (number/bool/null/object/array) so typed MCP schemas work. */
+                bool as_str = call->args[i].is_string;
+                const char *v = call->args[i].value ? call->args[i].value : "";
+                if (as_str && v[0] && v[0] != '"' &&
+                    agent_mcp_value_looks_json(v))
+                    as_str = false;
+                is_string[i] = as_str;
             }
         }
         char *args_json = ds4_mcp_build_args_json(names, values, is_string, n);
@@ -11261,7 +11317,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
-        char web_approval_msg[256];
+        char web_approval_msg[768];
         if (worker_take_web_approval_request(&worker, web_approval_msg,
                                              sizeof(web_approval_msg)))
         {

@@ -1041,6 +1041,12 @@ char *ds4_mcp_build_args_json(const char *const *names,
  * ============================================================================
  */
 
+typedef enum {
+    MCP_RPC_OK = 0,
+    MCP_RPC_APP_ERROR = 1,   /* JSON-RPC error object; process still healthy */
+    MCP_RPC_TRANSPORT = -1,  /* pipe/timeout/interrupt; process may be dead */
+} mcp_rpc_status;
+
 static void mcp_ignore_sigpipe_once(void) {
     static int done = 0;
     if (done) return;
@@ -1219,27 +1225,47 @@ static char *mcp_server_take_message(mcp_server *s) {
             return msg;
         }
 
-        /* NDJSON: one JSON object per line. Drop non-object banner lines. */
+        /* NDJSON: complete JSON value ending at a newline (not just first line). */
         char *nl = memchr(s->rx.ptr, '\n', s->rx.len);
         if (!nl) return NULL;
-        size_t line_len = (size_t)(nl - s->rx.ptr);
-        size_t trim = line_len;
-        if (trim > 0 && s->rx.ptr[trim - 1] == '\r') trim--;
-        if (trim == 0 || s->rx.ptr[0] != '{') {
-            size_t remain = s->rx.len - line_len - 1;
-            memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
-            s->rx.len = remain;
-            s->rx.ptr[s->rx.len] = '\0';
-            continue;
+        /* Try successively longer prefixes ending at newlines until we have
+         * one complete JSON value. */
+        size_t try_end = 0;
+        for (;;) {
+            char *nln = memchr(s->rx.ptr + try_end, '\n', s->rx.len - try_end);
+            if (!nln) return NULL;
+            size_t line_end = (size_t)(nln - s->rx.ptr) + 1;
+            size_t trim = line_end;
+            if (trim > 0 && s->rx.ptr[trim - 1] == '\n') trim--;
+            if (trim > 0 && s->rx.ptr[trim - 1] == '\r') trim--;
+            if (trim == 0 || s->rx.ptr[0] != '{') {
+                /* Banner / blank: drop through this newline and restart. */
+                size_t remain = s->rx.len - line_end;
+                memmove(s->rx.ptr, s->rx.ptr + line_end, remain);
+                s->rx.len = remain;
+                s->rx.ptr[s->rx.len] = '\0';
+                break; /* outer for(;;) will re-examine buffer */
+            }
+            /* Temporarily NUL-terminate candidate and validate. */
+            char saved = s->rx.ptr[trim];
+            s->rx.ptr[trim] = '\0';
+            const char *vend = mcp_json_skip_value(s->rx.ptr);
+            bool complete = vend && *vend == '\0';
+            s->rx.ptr[trim] = saved;
+            if (complete) {
+                char *msg = mcp_xmalloc(trim + 1);
+                memcpy(msg, s->rx.ptr, trim);
+                msg[trim] = '\0';
+                size_t remain = s->rx.len - line_end;
+                memmove(s->rx.ptr, s->rx.ptr + line_end, remain);
+                s->rx.len = remain;
+                s->rx.ptr[s->rx.len] = '\0';
+                return msg;
+            }
+            try_end = line_end;
+            if (try_end >= s->rx.len) return NULL;
         }
-        char *msg = mcp_xmalloc(trim + 1);
-        memcpy(msg, s->rx.ptr, trim);
-        msg[trim] = '\0';
-        size_t remain = s->rx.len - line_len - 1;
-        memmove(s->rx.ptr, s->rx.ptr + line_len + 1, remain);
-        s->rx.len = remain;
-        s->rx.ptr[s->rx.len] = '\0';
-        return msg;
+        continue;
     }
 }
 
@@ -1301,8 +1327,18 @@ static char *mcp_server_recv_matching(ds4_mcp *mcp, mcp_server *s, int id,
     }
 }
 
-static char *mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
-                     const char *params_json, char *err, size_t err_len) {
+/*
+ * Perform a JSON-RPC request.
+ * - MCP_RPC_OK: *resp_out is the full response body (caller frees).
+ * - MCP_RPC_APP_ERROR: server returned error; *resp_out may be NULL; err set;
+ *   connection remains usable.
+ * - MCP_RPC_TRANSPORT: I/O/timeout/cancel; *resp_out NULL; connection suspect.
+ */
+static mcp_rpc_status mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
+                              const char *params_json,
+                              char **resp_out,
+                              char *err, size_t err_len) {
+    if (resp_out) *resp_out = NULL;
     int id = s->next_id++;
     mcp_buf req = {0};
     char *qmethod = mcp_json_quote(method);
@@ -1320,21 +1356,23 @@ static char *mcp_rpc(ds4_mcp *mcp, mcp_server *s, const char *method,
     mcp_log(mcp, "mcp %s -> %s", s->name, method);
     if (mcp_server_send(mcp, s, wire, err, err_len) != 0) {
         free(wire);
-        return NULL;
+        return MCP_RPC_TRANSPORT;
     }
     free(wire);
     char *resp = mcp_server_recv_matching(mcp, s, id, DS4_MCP_IO_TIMEOUT_MS,
                                           err, err_len);
-    if (!resp) return NULL;
+    if (!resp) return MCP_RPC_TRANSPORT;
     if (mcp_json_has_error(resp)) {
         char *em = mcp_json_error_message(resp);
         mcp_set_err(err, err_len, "MCP %s error: %s", method,
                     em ? em : "unknown error");
         free(em);
         free(resp);
-        return NULL;
+        return MCP_RPC_APP_ERROR;
     }
-    return resp;
+    if (resp_out) *resp_out = resp;
+    else free(resp);
+    return MCP_RPC_OK;
 }
 
 static int mcp_notify(ds4_mcp *mcp, mcp_server *s, const char *method,
@@ -1707,10 +1745,13 @@ static int mcp_server_list_all_tools(ds4_mcp *mcp, mcp_server *s,
             mcp_buf_puts(&params, "{}");
         }
         char *params_s = mcp_buf_take(&params);
-        char *list_resp = mcp_rpc(mcp, s, "tools/list", params_s, err, err_len);
+        char *list_resp = NULL;
+        mcp_rpc_status st = mcp_rpc(mcp, s, "tools/list", params_s,
+                                    &list_resp, err, err_len);
         free(params_s);
-        if (!list_resp) {
+        if (st != MCP_RPC_OK) {
             free(cursor);
+            free(list_resp);
             return -1;
         }
         char *list_result = mcp_json_get_result_raw(list_resp);
@@ -1751,8 +1792,9 @@ static int mcp_server_initialize(ds4_mcp *mcp, mcp_server *s,
         "\"capabilities\":{},"
         "\"clientInfo\":{\"name\":\"ds4-agent\",\"version\":\"1.0.0\"}"
         "}";
-    char *resp = mcp_rpc(mcp, s, "initialize", params, err, err_len);
-    if (!resp) return -1;
+    char *resp = NULL;
+    if (mcp_rpc(mcp, s, "initialize", params, &resp, err, err_len) != MCP_RPC_OK)
+        return -1;
     char *result = mcp_json_get_result_raw(resp);
     free(resp);
     if (result) {
@@ -2099,6 +2141,71 @@ bool ds4_mcp_has_tool(const ds4_mcp *mcp, const char *exposed_name) {
     return false;
 }
 
+bool ds4_mcp_is_configured_tool(const ds4_mcp *mcp, const char *exposed_name) {
+    if (!mcp || !exposed_name) return false;
+    char server[DS4_MCP_MAX_SERVER_NAME + 1];
+    char tool[DS4_MCP_MAX_TOOL_NAME + 1];
+    if (!ds4_mcp_split_exposed_name(exposed_name, server, sizeof(server),
+                                    tool, sizeof(tool)))
+        return false;
+    for (int i = 0; i < mcp->server_count; i++) {
+        if (mcp->servers[i].name && !mcp->servers[i].disabled &&
+            !strcmp(mcp->servers[i].name, server))
+            return true;
+    }
+    return false;
+}
+
+/* Mark a live server dead if its process has exited. Does not free tools. */
+static void mcp_server_refresh_liveness(mcp_server *s) {
+    if (!s || !s->connected || s->pid <= 0) return;
+    int status = 0;
+    pid_t r = waitpid(s->pid, &status, WNOHANG);
+    if (r == s->pid || (r < 0 && errno == ECHILD)) {
+        s->connected = false;
+        s->pid = -1;
+        if (s->stdin_fd >= 0) { close(s->stdin_fd); s->stdin_fd = -1; }
+        if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
+        if (s->stderr_fd >= 0) { close(s->stderr_fd); s->stderr_fd = -1; }
+        free(s->rx.ptr);
+        s->rx.ptr = NULL;
+        s->rx.len = s->rx.cap = 0;
+    }
+}
+
+/* Spawn + initialize one server only (used for on-demand reconnect). */
+static int mcp_server_ensure_connected(ds4_mcp *mcp, mcp_server *s,
+                                       char *err, size_t err_len) {
+    if (!s || s->disabled) {
+        mcp_set_err(err, err_len, "MCP server disabled");
+        return -1;
+    }
+    mcp_server_refresh_liveness(s);
+    if (s->connected) return 0;
+
+    /* Drop stale runtime without discarding the tool catalog: tools are
+     * re-listed on initialize and replace duplicates. */
+    if (s->pid > 0 || s->stdin_fd >= 0 || s->stdout_fd >= 0)
+        mcp_server_shutdown_runtime(s);
+
+    char serr[160] = {0};
+    if (mcp_server_spawn(mcp, s, serr, sizeof(serr)) != 0) {
+        mcp_set_err(err, err_len, "%s", serr);
+        return -1;
+    }
+    /* Remove previous catalog for this server before re-list so we do not
+     * accumulate duplicates across reconnects. */
+    mcp_remove_tools_for_server(mcp, s->name);
+    if (mcp_server_initialize(mcp, s, serr, sizeof(serr)) != 0) {
+        mcp_remove_tools_for_server(mcp, s->name);
+        mcp_server_shutdown_runtime(s);
+        mcp_set_err(err, err_len, "%s", serr);
+        return -1;
+    }
+    mcp->connected = true;
+    return 0;
+}
+
 char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
                         const char *args_json,
                         char *err, size_t err_len) {
@@ -2128,34 +2235,20 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         return NULL;
     }
 
-    /* Reconnect this server if it died or never started. */
-    if (!s->connected) {
+    /* Ensure this server is live (and only this server). */
+    {
         char cerr[192] = {0};
-        if (ds4_mcp_connect(mcp, cerr, sizeof(cerr)) != 0 && !s->connected) {
-            mcp_set_err(err, err_len, "MCP server not connected: %s%s%s",
-                        server, cerr[0] ? " (" : "", cerr[0] ? cerr : "");
-            if (cerr[0]) {
-                /* keep message compact */
-            }
+        if (mcp_server_ensure_connected(mcp, s, cerr, sizeof(cerr)) != 0) {
+            mcp_set_err(err, err_len, "MCP server not connected: %s (%s)",
+                        server, cerr[0] ? cerr : "connect failed");
             return NULL;
         }
     }
-    if (!s->connected) {
-        mcp_set_err(err, err_len, "MCP server not connected: %s", server);
-        return NULL;
-    }
     mcp_server_drain_stderr(mcp, s);
 
-    bool known = false;
-    for (int i = 0; i < mcp->tool_count; i++) {
-        if (mcp->tools[i].exposed_name &&
-            !strcmp(mcp->tools[i].exposed_name, exposed_name))
-        {
-            known = true;
-            break;
-        }
-    }
-    if (!known) {
+    /* After reconnect, tools were re-listed. If the specific tool is still
+     * missing, report that without tearing down the server. */
+    if (!ds4_mcp_has_tool(mcp, exposed_name)) {
         mcp_set_err(err, err_len, "unknown MCP tool: %s", exposed_name);
         return NULL;
     }
@@ -2170,16 +2263,24 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
     mcp_buf_puts(&params, "}");
     char *params_s = mcp_buf_take(&params);
 
+    char *resp = NULL;
     pthread_mutex_lock(&mcp->mu);
-    char *resp = mcp_rpc(mcp, s, "tools/call", params_s, err, err_len);
+    mcp_rpc_status st = mcp_rpc(mcp, s, "tools/call", params_s, &resp, err, err_len);
     pthread_mutex_unlock(&mcp->mu);
     free(params_s);
-    if (!resp) {
-        /* Transport failure: drop runtime so a later call can respawn. */
-        mcp_remove_tools_for_server(mcp, s->name);
+
+    if (st == MCP_RPC_TRANSPORT) {
+        /* Keep tool catalog; only drop the live process so a later call
+         * can respawn via mcp_server_ensure_connected. */
         mcp_server_shutdown_runtime(s);
         if (ds4_mcp_connected_server_count(mcp) == 0)
             mcp->connected = false;
+        if (!err[0])
+            mcp_set_err(err, err_len, "MCP transport error calling %s", exposed_name);
+        return NULL;
+    }
+    if (st == MCP_RPC_APP_ERROR) {
+        /* Protocol/application error: process stays up, tools stay registered. */
         return NULL;
     }
 
@@ -2190,7 +2291,7 @@ char *ds4_mcp_call_tool(ds4_mcp *mcp, const char *exposed_name,
         return NULL;
     }
 
-    /* isError flag */
+    /* isError flag is a normal tool-level failure, not transport death. */
     if (mcp_json_get_bool(result, "isError", false)) {
         char *text = mcp_extract_call_text(result);
         mcp_set_err(err, err_len, "%s", text && text[0] ? text : "MCP tool error");
