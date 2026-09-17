@@ -40,7 +40,7 @@ def check_fixtures(binary, directory):
     assert all(wcswidth(line) <= 40 for line in footer.splitlines()[:-1])
     print(f"Footer: {len(data)} bytes including setup, no prompt erasure, 3 balanced frames")
     expected = {"google_search", "visit_page", "bash", "bash_status", "bash_stop",
-                "read", "more", "write", "edit", "search", "list"}
+                "read", "more", "write", "edit", "search", "list", "goal"}
     for family in ("glm", "dsml", "qwen"):
         for vision in (0, 1):
             prompt = (directory / f"prompt-{family}-{vision}.txt").read_text()

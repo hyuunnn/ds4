@@ -133,6 +133,12 @@ typedef struct {
     } applied;
 } agent_hints;
 
+typedef enum {
+    AGENT_GOAL_NONE,
+    AGENT_GOAL_MET,
+    AGENT_GOAL_BLOCKED,
+} agent_goal_verdict;
+
 typedef struct {
     ds4_engine *engine;
     agent_config *cfg;
@@ -183,6 +189,14 @@ typedef struct {
     char *queued_user_drain_text;
     bool datetime_context_injected;
     agent_hints hints;
+    /* /goal state is runtime-only like hints: it is swapped by the UI thread
+     * under mu and never written into saved sessions.  The verdict fields are
+     * set by the goal tool during tool execution and consumed by the worker
+     * once the tool result is committed to the transcript. */
+    char *goal;
+    int goal_nudges;
+    agent_goal_verdict goal_verdict;
+    char *goal_verdict_reason;
     int last_system_prompt_reminder_at;
     char more_path[PATH_MAX];
     int more_next_line;
@@ -638,6 +652,7 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/think") ||
            agent_slash_command_with_args(cmd, "/steer") ||
            agent_slash_command_with_args(cmd, "/hints") ||
+           agent_slash_command_with_args(cmd, "/goal") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -1273,6 +1288,21 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"goal\",\n"
+    "    \"description\": \"Resolve the active /goal condition: met=true only when evidence above verifies it, met=false when blocked on a user decision. Never call without an active /goal.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"met\": {\"type\": \"boolean\"},\n"
+    "        \"reason\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"met\", \"reason\"]\n"
+    "    }\n"
+    "  }\n"
     "}\n"
     "\n"
     "# Rules\n\n"
@@ -1353,7 +1383,8 @@ static const char agent_glm_tool_schemas[] =
     "{\"name\":\"write\",\"description\":\"Create or overwrite a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}\n"
     "{\"name\":\"edit\",\"description\":\"Replace one exact old text match.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}},\"required\":[\"path\",\"old\",\"new\"]}}\n"
     "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
-    "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
+    "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n"
+    "{\"name\":\"goal\",\"description\":\"Resolve the active /goal condition: met=true only when evidence above verifies it, met=false when blocked on a user decision. Never call without an active /goal.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"met\":{\"type\":\"boolean\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"met\",\"reason\"]}}\n";
 
 static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
@@ -5339,6 +5370,43 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     return rc;
 }
 
+/* Reset all /goal state: clearing drops a pending verdict and the check
+ * counter so a later goal starts fresh. */
+static void worker_goal_reset_locked(agent_worker *w) {
+    free(w->goal);
+    w->goal = NULL;
+    w->goal_nudges = 0;
+    w->goal_verdict = AGENT_GOAL_NONE;
+    free(w->goal_verdict_reason);
+    w->goal_verdict_reason = NULL;
+}
+
+/* Swap the active goal; the caller owns the returned previous value. */
+static char *worker_goal_set(agent_worker *w, const char *text) {
+    pthread_mutex_lock(&w->mu);
+    char *old = w->goal;
+    w->goal = NULL;              /* keep old out of the reset free below */
+    worker_goal_reset_locked(w);
+    if (text && text[0]) w->goal = xstrdup(text);
+    pthread_mutex_unlock(&w->mu);
+    return old;
+}
+
+static char *worker_goal_snapshot(agent_worker *w, int *nudges) {
+    pthread_mutex_lock(&w->mu);
+    char *goal = w->goal ? xstrdup(w->goal) : NULL;
+    if (nudges) *nudges = w->goal_nudges;
+    pthread_mutex_unlock(&w->mu);
+    return goal;
+}
+
+static bool worker_goal_active(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool active = w->goal != NULL;
+    pthread_mutex_unlock(&w->mu);
+    return active;
+}
+
 /* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
  * checkpoint avoids paying this prefill cost repeatedly, but only when the
  * rendered prompt text still matches the file.  The same fixed path is shared
@@ -5421,6 +5489,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     w->status.greedy_sampling = false;
     w->status.error[0] = '\0';
     if (w->initialized) w->hints = (agent_hints){0};
+    worker_goal_reset_locked(w);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
@@ -6573,6 +6642,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->datetime_context_injected = true;
         pthread_mutex_lock(&w->mu);
         w->hints = (agent_hints){.applied = AGENT_HINTS_UNKNOWN};
+        worker_goal_reset_locked(w);
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
@@ -9448,6 +9518,43 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_puts(obs, meta);
 }
 
+/* The goal tool is how the model resolves an active /goal: met=true declares
+ * the condition verified by the work above, met=false reports a blocker for
+ * the user.  The verdict is consumed by worker_run_turn only after the tool
+ * result is committed, so the declaration stays in the transcript. */
+static char *agent_tool_goal(agent_worker *w, const agent_tool_call *call) {
+    /* met is parsed strictly: a padded or unknown value is a tool error the
+     * model can retry, not an implicit "blocked" that ends the goal. */
+    const char *met_arg = agent_tool_arg_value(call, "met");
+    while (met_arg && isspace((unsigned char)*met_arg)) met_arg++;
+    size_t met_len = met_arg ? strlen(met_arg) : 0;
+    while (met_len && isspace((unsigned char)met_arg[met_len - 1])) met_len--;
+    char met_buf[8];
+    if (!met_len || met_len >= sizeof(met_buf))
+        return xstrdup("Tool error: goal requires met (true|false)\n");
+    memcpy(met_buf, met_arg, met_len);
+    met_buf[met_len] = '\0';
+    bool met;
+    if (!strcasecmp(met_buf, "true") || !strcasecmp(met_buf, "yes") ||
+        !strcmp(met_buf, "1")) met = true;
+    else if (!strcasecmp(met_buf, "false") || !strcasecmp(met_buf, "no") ||
+             !strcmp(met_buf, "0")) met = false;
+    else return xstrdup("Tool error: goal requires met (true|false)\n");
+    const char *reason = agent_tool_arg_value(call, "reason");
+    pthread_mutex_lock(&w->mu);
+    bool active = w->goal != NULL;
+    if (active) {
+        free(w->goal_verdict_reason);
+        w->goal_verdict_reason = xstrdup(reason ? reason : "");
+        w->goal_verdict = met ? AGENT_GOAL_MET : AGENT_GOAL_BLOCKED;
+    }
+    pthread_mutex_unlock(&w->mu);
+    if (!active)
+        return xstrdup("Tool error: no active /goal; set one with /goal <condition>\n");
+    return xstrdup(met ? "Goal verdict recorded: met.\n"
+                       : "Goal verdict recorded: blocked; returning to the user.\n");
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -9461,6 +9568,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "list")) return agent_tool_list(call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
+    if (!strcmp(call->name, "goal")) return agent_tool_goal(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
     if (!strcmp(call->name, "visit_page")) return agent_tool_visit_page(w, call);
 
@@ -10285,6 +10393,87 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
     pthread_mutex_unlock(&w->mu);
 }
 
+typedef enum {
+    AGENT_DRAIN_NONE,         /* nothing was queued */
+    AGENT_DRAIN_APPENDED,     /* queued text appended; continue the turn loop */
+    AGENT_DRAIN_INTERRUPTED,  /* caller returns 0 */
+    AGENT_DRAIN_ERROR,        /* status set; caller returns 1 */
+} agent_drain_result;
+
+/* Pull user text queued while the worker was busy and append it as the next
+ * user message.  Turn boundaries are the safe points for this. */
+static agent_drain_result worker_drain_queued_user(agent_worker *w,
+                                                   char *err, size_t err_len) {
+    char *queued = worker_request_queued_user_drain(w);
+    if (!queued || !queued[0]) {
+        free(queued);
+        return AGENT_DRAIN_NONE;
+    }
+    agent_trace_text(w, "queued_user", queued, strlen(queued));
+    bool ok = agent_worker_append_user(w, queued, err, err_len);
+    if (!ok) {
+        if (agent_err_is_interrupted(err)) {
+            free(queued);
+            worker_clear_interrupt(w);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return AGENT_DRAIN_INTERRUPTED;
+        }
+        /* The text was already taken from the UI queue; surface it so the
+         * user can resend instead of losing it silently. */
+        agent_publishf_system_status(w, "Dropped queued input: %.160s", queued);
+        free(queued);
+        agent_set_error(w, err);
+        return AGENT_DRAIN_ERROR;
+    }
+    free(queued);
+    pthread_mutex_lock(&w->mu);
+    w->user_activity = true;
+    w->session_dirty = true;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+    return AGENT_DRAIN_APPENDED;
+}
+
+/* While a /goal is active, a turn that ends with a plain answer is not the end
+ * of the work: the worker appends a synthetic user check and the tool-round
+ * loop continues.  The model either keeps working or resolves the goal through
+ * the goal tool, so the stopping condition is the user's condition rather than
+ * a turn count.  The goal text is re-injected on every check so context
+ * compaction cannot silently drop it; the check number keeps long loops
+ * visible in the transcript. */
+static int agent_worker_goal_nudge(agent_worker *w, char *err, size_t err_len) {
+    int nudges = 0;
+    char *goal = worker_goal_snapshot(w, &nudges);
+    if (!goal) return 0;
+
+    agent_buf b = {0};
+    char head[64];
+    snprintf(head, sizeof(head), "[ds4-agent goal check %d]\n", nudges + 1);
+    agent_buf_puts(&b, head);
+    agent_buf_puts(&b, "Active goal: ");
+    agent_buf_puts(&b, goal);
+    agent_buf_puts(&b,
+        "\nJudge whether the goal is met from evidence produced above, not "
+        "from intent. If it is met, reply with only a goal tool call: met=true "
+        "and a one-sentence reason. If you are blocked on something only the "
+        "user can decide, call goal with met=false and the blocker as the "
+        "reason. Otherwise continue working toward the goal now; do not just "
+        "describe what you would do next.\n");
+    free(goal);
+    char *text = agent_buf_take(&b);
+    bool ok = agent_worker_append_user(w, text, err, err_len);
+    if (ok) {
+        agent_trace_text(w, "goal_nudge", text, strlen(text));
+        pthread_mutex_lock(&w->mu);
+        if (w->goal) w->goal_nudges++;
+        w->session_dirty = true;
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+    }
+    free(text);
+    return ok ? 1 : -1;
+}
+
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
@@ -10648,6 +10837,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_worker_append_assistant_turn_end(w);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
+            if (worker_goal_active(w))
+                agent_publish_system_status(
+                    w, "Goal still active; /goal clear removes it.");
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -10712,12 +10904,50 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
+            if (worker_goal_active(w)) {
+                /* A turn boundary is also where queued user input belongs:
+                 * drain it before nudging so typed text is not starved by a
+                 * running goal loop.  The assistant response just ended, so
+                 * its carried generation budget must not leak into the next
+                 * response started by the drain or the nudge. */
+                carried_generation = 0;
+                agent_drain_result dr = worker_drain_queued_user(
+                    w, compact_err, sizeof(compact_err));
+                if (dr == AGENT_DRAIN_APPENDED) continue;
+                if (dr == AGENT_DRAIN_INTERRUPTED) return 0;
+                if (dr == AGENT_DRAIN_ERROR) return 1;
+                /* A /goal turns a plain stop into a checkpoint: keep the turn
+                 * alive with an evaluation nudge until the model resolves the
+                 * goal through the goal tool or the user clears it. */
+                char goal_err[160] = {0};
+                int goal_rc = agent_worker_goal_nudge(w, goal_err,
+                                                      sizeof(goal_err));
+                if (goal_rc > 0) continue;
+                if (goal_rc < 0) {
+                    if (agent_err_is_interrupted(goal_err)) {
+                        worker_clear_interrupt(w);
+                        agent_set_status(w, AGENT_WORKER_IDLE);
+                        return 0;
+                    }
+                    agent_set_error(w, goal_err[0] ?
+                                    goal_err : "unable to append goal check");
+                    return 1;
+                }
+            }
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
 
         agent_tool_observation observation;
         agent_tool_observation_init(&observation);
+        /* A verdict may only come from the calls about to run.  Reset before
+         * building any observation so a stale verdict left by a failed commit
+         * cannot be consumed by a later error-only observation. */
+        pthread_mutex_lock(&w->mu);
+        w->goal_verdict = AGENT_GOAL_NONE;
+        free(w->goal_verdict_reason);
+        w->goal_verdict_reason = NULL;
+        pthread_mutex_unlock(&w->mu);
         if (early_tool_error) {
             agent_tool_observation_puts(&observation, "Tool error: ");
             agent_tool_observation_puts(
@@ -10797,26 +11027,41 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_dsml_parser_free(&dsml);
         carried_generation = 0;
 
-        char *queued_user = worker_request_queued_user_drain(w);
-        if (queued_user && queued_user[0]) {
-            agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            if (!agent_worker_append_user(w, queued_user, compact_err, sizeof(compact_err))) {
-                free(queued_user);
-                if (agent_err_is_interrupted(compact_err)) {
-                    worker_clear_interrupt(w);
-                    agent_set_status(w, AGENT_WORKER_IDLE);
-                    return 0;
-                }
-                agent_set_error(w, compact_err);
-                return 1;
-            }
-            pthread_mutex_lock(&w->mu);
-            w->user_activity = true;
-            w->session_dirty = true;
-            agent_wake_locked(w);
-            pthread_mutex_unlock(&w->mu);
+        /* A goal verdict ends the turn once the observation is committed, so
+         * the transcript still records the declaration.  Verdict and goal are
+         * consumed in one critical section: a UI /goal swap either runs before
+         * this (leaving verdict NONE) or after it (new goal untouched).
+         * Queued user input is deliberately not drained here: it becomes the
+         * next regular turn. */
+        pthread_mutex_lock(&w->mu);
+        agent_goal_verdict goal_verdict = w->goal_verdict;
+        w->goal_verdict = AGENT_GOAL_NONE;
+        char *verdict_reason = w->goal_verdict_reason;
+        w->goal_verdict_reason = NULL;
+        char *finished_goal = NULL;
+        if (goal_verdict != AGENT_GOAL_NONE) {
+            finished_goal = w->goal;
+            w->goal = NULL;
+            w->goal_nudges = 0;
         }
-        free(queued_user);
+        pthread_mutex_unlock(&w->mu);
+        if (goal_verdict != AGENT_GOAL_NONE) {
+            agent_publishf_system_status(
+                w, goal_verdict == AGENT_GOAL_MET ? "Goal met%s%s" :
+                    "Goal blocked%s%s",
+                verdict_reason && verdict_reason[0] ? ": " : "",
+                verdict_reason ? verdict_reason : "");
+            free(verdict_reason);
+            free(finished_goal);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
+        free(verdict_reason);
+
+        agent_drain_result drain_rc = worker_drain_queued_user(
+            w, compact_err, sizeof(compact_err));
+        if (drain_rc == AGENT_DRAIN_INTERRUPTED) return 0;
+        if (drain_rc == AGENT_DRAIN_ERROR) return 1;
         continue;
 
 observation_error:
@@ -12620,6 +12865,7 @@ static void runtime_help(void) {
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /hints on|off Enable or disable brief programming hints; starts off.");
+    puts("  /goal [cond] Keep working until cond holds; /goal clear stops it.");
     puts("  /steer [F]   Show or set FFN steering for subsequent tokens.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
@@ -12726,6 +12972,8 @@ static void agent_worker_free(agent_worker *w) {
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
+    free(w->goal);
+    free(w->goal_verdict_reason);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
@@ -13327,6 +13575,38 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         pthread_mutex_unlock(&worker.mu);
                         printf("hints %s (applies at the next conversation boundary)\n",
                                enabled ? "on" : "off");
+                    }
+                } else if (agent_slash_command_with_args(cmd, "/goal")) {
+                    char *arg = cmd + strlen("/goal");
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        int nudges = 0;
+                        char *g = worker_goal_snapshot(&worker, &nudges);
+                        if (g) {
+                            printf("goal: %s", g);
+                            if (nudges) printf(" (%d checks)", nudges);
+                            printf("\n");
+                            free(g);
+                        } else {
+                            printf("no active goal\n");
+                        }
+                    } else if (!strcmp(arg, "clear") || !strcmp(arg, "off")) {
+                        char *old = worker_goal_set(&worker, NULL);
+                        if (old) printf("goal cleared: %s\n", old);
+                        else printf("no active goal\n");
+                        free(old);
+                    } else {
+                        free(worker_goal_set(&worker, arg));
+                        printf("goal set: %s%s\n", arg,
+                               busy ? " (applies at the next turn boundary)" : "");
+                        /* The condition is the directive: submit it as a turn
+                         * when idle; while busy it is queued so a boundary
+                         * drain or the next idle submission picks it up with
+                         * the goal already armed. */
+                        if (!busy && worker_submit(&worker, arg))
+                            agent_echo_user_prompt(arg);
+                        else
+                            agent_prompt_queue_push(&queue, arg);
                     }
                 } else if (!strncmp(cmd, "/steer", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {

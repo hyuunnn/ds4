@@ -681,6 +681,7 @@ static void test_tool_contracts(void) {
                            glm ? agent_build_glm_tools_prompt(false, vision) :
                                  agent_build_dsml_tools_prompt(false, vision);
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
+            AGENT_TEST_ASSERT(strstr(prompt, "\"goal\"") != NULL);
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
             char name[64];
@@ -689,6 +690,89 @@ static void test_tool_contracts(void) {
             free(prompt);
         }
     }
+}
+
+static void test_agent_goal_state(void) {
+    AGENT_TEST_ASSERT(agent_slash_command_known("/goal"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/goal fix tests"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/goalx"));
+
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    AGENT_TEST_ASSERT(!worker_goal_active(&w));
+
+    agent_tool_call met_call = {.name = xstrdup("goal")};
+    test_tool_arg(&met_call, "met", "true");
+    test_tool_arg(&met_call, "reason", "done");
+
+    /* The goal tool refuses to resolve a goal that was never set. */
+    char *res = agent_execute_tool_call(&w, &met_call);
+    AGENT_TEST_ASSERT(strstr(res, "no active /goal") != NULL);
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_NONE);
+    free(res);
+
+    AGENT_TEST_ASSERT(worker_goal_set(&w, "tests pass") == NULL);
+    AGENT_TEST_ASSERT(worker_goal_active(&w));
+    int nudges = -1;
+    char *g = worker_goal_snapshot(&w, &nudges);
+    AGENT_TEST_ASSERT(g && !strcmp(g, "tests pass") && nudges == 0);
+    free(g);
+
+    res = agent_execute_tool_call(&w, &met_call);
+    AGENT_TEST_ASSERT(!strcmp(res, "Goal verdict recorded: met.\n"));
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_MET);
+    AGENT_TEST_ASSERT(w.goal_verdict_reason && !strcmp(w.goal_verdict_reason, "done"));
+    free(res);
+
+    /* met=false reports a blocker for the user. */
+    agent_tool_call blocked_call = {.name = xstrdup("goal")};
+    test_tool_arg(&blocked_call, "met", "false");
+    test_tool_arg(&blocked_call, "reason", "need user choice");
+    res = agent_execute_tool_call(&w, &blocked_call);
+    AGENT_TEST_ASSERT(
+        !strcmp(res, "Goal verdict recorded: blocked; returning to the user.\n"));
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_BLOCKED);
+    AGENT_TEST_ASSERT(!strcmp(w.goal_verdict_reason, "need user choice"));
+    free(res);
+    agent_tool_call_free(&blocked_call);
+
+    /* A missing or unparseable met argument is a tool error, not a verdict. */
+    agent_tool_call bare_call = {.name = xstrdup("goal")};
+    test_tool_arg(&bare_call, "reason", "no verdict");
+    res = agent_execute_tool_call(&w, &bare_call);
+    AGENT_TEST_ASSERT(strstr(res, "requires met") != NULL);
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_BLOCKED);
+    free(res);
+    agent_tool_call_free(&bare_call);
+
+    agent_tool_call bad_call = {.name = xstrdup("goal")};
+    test_tool_arg(&bad_call, "met", "\"true\"");
+    res = agent_execute_tool_call(&w, &bad_call);
+    AGENT_TEST_ASSERT(strstr(res, "requires met") != NULL);
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_BLOCKED);
+    free(res);
+    agent_tool_call_free(&bad_call);
+
+    /* Padded values still parse. */
+    agent_tool_call padded_call = {.name = xstrdup("goal")};
+    test_tool_arg(&padded_call, "met", " true ");
+    res = agent_execute_tool_call(&w, &padded_call);
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_MET);
+    free(res);
+    agent_tool_call_free(&padded_call);
+
+    /* A replacement goal resets the verdict and the check counter. */
+    w.goal_nudges = 7;
+    char *old = worker_goal_set(&w, "blocked goal");
+    AGENT_TEST_ASSERT(old && !strcmp(old, "tests pass"));
+    free(old);
+    AGENT_TEST_ASSERT(w.goal_verdict == AGENT_GOAL_NONE && w.goal_nudges == 0);
+
+    free(worker_goal_set(&w, NULL));
+    AGENT_TEST_ASSERT(!worker_goal_active(&w) && w.goal == NULL &&
+                      w.goal_verdict_reason == NULL);
+    agent_tool_call_free(&met_call);
+    pthread_mutex_destroy(&w.mu);
 }
 
 /* Model-free real-PTY driver for tests/ds4_agent_terminal_test.py. */
@@ -1033,6 +1117,7 @@ int main(int argc, char **argv) {
     test_unicode_output_and_footer();
     test_footer_only_updates();
     test_tool_contracts();
+    test_agent_goal_state();
     if (agent_test_failures) {
         fprintf(stderr, "ds4-agent tests: %d failure(s)\n",
                 agent_test_failures);

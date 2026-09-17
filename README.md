@@ -141,6 +141,12 @@ behind the work, and `/hints off` to stop them. Changes take effect at the next
 conversation boundary without rebuilding the cached context. New and resumed
 sessions start with hints off.
 
+`/goal <condition>` keeps the agent working across turns until the model
+verifies the condition and declares it met, or reports itself blocked.
+`/goal` shows the active condition and `/goal clear` stops it. Goals are
+runtime state and are not written into saved sessions; see
+[goals](docs/GOAL.md).
+
 Sessions are stored in `~/.ds4/kvcache`:
 
 | Command | Action |
